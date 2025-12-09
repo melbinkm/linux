@@ -1,0 +1,11 @@
+{
+  "file": "drivers/vhost/scsi.c",
+  "total_scenarios": 60,
+  "confirmed_vulns": 3,
+  "last_scenario_id": "drivers/vhost/scsi.c-0060",
+  "high_level_findings": [
+    "Confirmed Denial of Service via stalled worker in `vhost_scsi_handle_vq` due to lack of weight check in completion path.",
+    "Confirmed Resource Leak in `vhost_scsi_target_queue_cmd` on initialization failure.",
+    "Confirmed Host Memory Exhaustion risk due to integer underflow in `exp_data_len` leading to huge allocations."
+  ]
+}

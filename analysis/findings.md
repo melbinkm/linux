@@ -1,82 +1,122 @@
-### drivers/virtio/virtio_ring.c — drivers/virtio/virtio_ring.c-0017: Broken Ring State Persistence
+### drivers/vhost/scsi.c — drivers/vhost/scsi.c-0002: Denial of Service via Stalled Worker in vhost_scsi_handle_vq
 
 **What is the attack?**
-- **Setup:** A virtio driver (e.g. virtio_net) encounters a fatal error or timeout and attempts to reset the queue using `virtqueue_reset`.
-- **Trigger:** The queue has previously been marked as "broken" (e.g., via `virtqueue_notify` failing or `virtio_break_device`).
+- **Setup:** A standard vhost-scsi configuration with a malicious guest.
+- **Trigger:** The guest issues a large number of SCSI commands that complete almost immediately or are aborted/failed rapidly.
 - **Mechanism:**
-  - `virtqueue_reset` calls `virtqueue_disable_and_recycle` to clean up.
-  - It then calls `virtqueue_reinit_split` (or packed).
-  - `virtqueue_reinit_split` calls `virtqueue_init`.
-  - `virtqueue_init` initializes indices but does *not* clear the `vq->broken` flag.
-  - `__vring_new_virtqueue_split` (used during initial creation) sets `broken = false`.
-  - Consequently, the reset queue remains marked as `broken`.
-  - Any subsequent `virtqueue_add` or `virtqueue_kick` will fail immediately with `-EIO` or return false because `unlikely(vq->broken)` is true.
+  - `vhost_scsi_handle_vq` processes incoming commands. It has a weight check for incoming commands.
+  - However, when commands complete, `vhost_scsi_complete_cmd_work` is scheduled.
+  - This function iterates over `svq->completion_list` using `llist_del_all`.
+  - If the completion list contains a massive number of commands (e.g., thousands or millions, if the guest managed to queue them), `vhost_scsi_complete_cmd_work` will loop processing all of them without yielding or checking limits.
+  - This stalls the vhost worker thread, preventing other work (other VQs, other devices sharing the worker) from running.
 
 **What can an attacker do?**
-- **Impact:** Persistent Denial of Service (DoS).
-- **Capability:** If an attacker (e.g., a malicious host or a local user triggering a condition that breaks the queue) can cause the queue to be marked broken, the driver's recovery mechanism (`virtqueue_reset`) will fail to restore functionality. The device becomes permanently unusable without a full driver reload.
+- **Impact:** Persistent Denial of Service (DoS) on the host's vhost worker thread.
+- **Capability:** A single guest can monopolize the shared worker thread, affecting other guests or devices.
 
 **What’s the impact?**
 - **Severity:** Medium.
-- **Prerequisites:** Ability to trigger a queue break (e.g., host notification failure).
+- **Prerequisites:** Malicious guest.
 
 **Which code files need manual audit to confirm this?**
-- `drivers/virtio/virtio_ring.c`: `virtqueue_reset`, `virtqueue_reinit_split`, `virtqueue_init`.
+- `drivers/vhost/scsi.c`: `vhost_scsi_complete_cmd_work`.
 
 **Where is the vulnerable code snippet?**
 ```c
-drivers/virtio/virtio_ring.c:2648
-	if (vq->packed_ring)
-		virtqueue_reinit_packed(vq);
-	else
-		virtqueue_reinit_split(vq);
-
-	return virtqueue_enable_after_reset(_vq);
+drivers/vhost/scsi.c:717
+	llnode = llist_del_all(&svq->completion_list);
+    ...
+	llist_for_each_entry_safe(cmd, t, llnode, tvc_completion_list) {
+        ...
+        // Heavy work: locking, signal, logging, release
+    }
 ```
-Neither `virtqueue_reinit_*` nor `virtqueue_enable_after_reset` clears `vq->broken`.
+The loop is unbounded.
 
 **What’s the fix (high-level)?**
-- Explicitly clear `vq->broken = false;` in `virtqueue_reset` after successful reinitialization.
+- Implement a budget/weight mechanism in `vhost_scsi_complete_cmd_work`.
+- If the budget is exceeded, stop processing, put the remaining list back (or queue a new work item), and yield.
 
 ---
 
-### drivers/virtio/virtio_ring.c — drivers/virtio/virtio_ring.c-0001: Use-After-Free in vring_interrupt with broken queue
+### drivers/vhost/scsi.c — drivers/vhost/scsi.c-0004: Resource Leak in vhost_scsi_target_queue_cmd failure
 
 **What is the attack?**
-- **Setup:** A virtio driver running on a system where the host is untrusted or can deliver interrupts asynchronously.
-- **Trigger:** The host delivers an interrupt (`vring_interrupt`) at the same time the kernel is breaking the device (`virtio_break_device`) or tearing it down.
+- **Setup:** vhost-scsi.
+- **Trigger:** Guest sends a command that causes `target_submit_prep` to fail (e.g., invalid CDB, invalid SGL mapping that wasn't caught earlier).
 - **Mechanism:**
-  - Thread A calls `virtio_break_device`, setting `vq->broken = true`.
-  - Thread B (interrupt handler) enters `vring_interrupt`.
-  - `vring_interrupt` checks `if (unlikely(vq->broken))`.
-  - If it passes this check (race condition: read happens before write or barriers are missing/weak), it proceeds.
-  - Thread A continues to tear down the device, potentially freeing the callback function pointer or data it points to.
-  - Thread B executes `vq->vq.callback(&vq->vq)`.
-  - If the callback data is freed, this is a Use-After-Free.
+  - `vhost_scsi_handle_vq` calls `vhost_scsi_target_queue_cmd`.
+  - Inside, `target_submit_prep` is called. If it returns error (e.g. -ENOMEM or -EINVAL from TCM), `vhost_scsi_target_queue_cmd` returns immediately.
+  - `vhost_scsi_handle_vq` sees the return, but `vhost_scsi_target_queue_cmd` is `void`. It assumes submission worked or was handled.
+  - The `vhost_scsi_cmd` object (`cmd`) has taken a reference to `inflight`. It is occupying a slot in `svq->scsi_cmds`.
+  - Since it wasn't submitted to TCM, TCM won't complete it.
+  - The driver logic doesn't call `vhost_scsi_release_cmd_res`.
+  - The command and its inflight reference are leaked.
+  - Repeatedly triggering this leaks all available tags.
 
 **What can an attacker do?**
-- **Impact:** Kernel Crash or potentially Code Execution (if callback pointer is corrupted).
-- **Capability:** A malicious host can spam interrupts during device teardown to trigger this race.
+- **Impact:** Persistent DoS (Device Hang).
+- **Capability:** Exhaust all command tags, making the device unusable.
 
 **What’s the impact?**
-- **Severity:** Low (requires precise timing and specific driver teardown behavior).
-- **Prerequisites:** Malicious host or buggy hardware.
+- **Severity:** High.
+- **Prerequisites:** Triggerable error in `target_submit_prep`.
 
 **Which code files need manual audit to confirm this?**
-- `drivers/virtio/virtio_ring.c`: `vring_interrupt`.
+- `drivers/vhost/scsi.c`: `vhost_scsi_target_queue_cmd`, `vhost_scsi_handle_vq`.
 
 **Where is the vulnerable code snippet?**
 ```c
-drivers/virtio/virtio_ring.c:2485
-	if (unlikely(vq->broken)) {
-        ...
-		return IRQ_HANDLED;
-	}
-    ...
-	if (vq->vq.callback)
-		vq->vq.callback(&vq->vq);
+drivers/vhost/scsi.c:1008
+	if (target_submit_prep(se_cmd, cdb, sg_ptr,
+			       cmd->tvc_sgl_count, NULL, 0, sg_prot_ptr,
+			       cmd->tvc_prot_sgl_count, GFP_KERNEL))
+		return;
 ```
-The check is insufficient if `broken` is set concurrently.
+It returns without cleaning up.
 
 **What’s the fix (high-level)?**
-- Use proper locking (e.g., `spin_lock`) or RCU synchronization to ensure `vq->vq.callback` is valid and the device is alive before invoking the callback. `virtio_break_device` takes `vqs_list_lock` but `vring_interrupt` does not.
+- Change `vhost_scsi_target_queue_cmd` to return an `int` error code.
+- Check the return value in `vhost_scsi_handle_vq`.
+- If failed, call `vhost_scsi_release_cmd_res` and send a failure status to the guest.
+
+---
+
+### drivers/vhost/scsi.c — drivers/vhost/scsi.c-0005: Host Memory Exhaustion via Integer Underflow in exp_data_len
+
+**What is the attack?**
+- **Setup:** T10 PI enabled vhost-scsi.
+- **Trigger:** Guest sends a PI request where `pi_bytesout` or `pi_bytesin` (prot_bytes) is larger than the total data length (`exp_data_len`).
+- **Mechanism:**
+  - `exp_data_len` is calculated from descriptor sizes (e.g. 1024 bytes).
+  - `prot_bytes` is read from the guest-provided header (e.g. 2048 bytes).
+  - The code calculates: `if (prot_bytes) { exp_data_len -= prot_bytes; ... }`.
+  - `exp_data_len` is `u32`. 1024 - 2048 underflows to `4294966272`.
+  - This huge value is passed to `vhost_scsi_mapal` as `data_bytes`.
+  - `vhost_scsi_mapal` calls `vhost_scsi_calc_sgls`.
+  - `iov_iter_npages` on `4GB` might return ~1 million pages.
+  - If `max_sgls` check passes (or if the overflow in calc_sgls logic described in Scenario 0001 also happens), the driver attempts to allocate huge scatterlists or iterate huge ranges.
+  - `vhost_scsi_calc_sgls` returns `sgl_count`. `sg_alloc_table_chained` is called.
+  - This allocates memory. Even if it fails later, it stresses the allocator.
+
+**What can an attacker do?**
+- **Impact:** Host Memory Exhaustion (DoS).
+- **Capability:** Force large allocations or expensive iterations.
+
+**What’s the impact?**
+- **Severity:** Medium.
+- **Prerequisites:** T10 PI feature bit enabled.
+
+**Which code files need manual audit to confirm this?**
+- `drivers/vhost/scsi.c`: `vhost_scsi_handle_vq`.
+
+**Where is the vulnerable code snippet?**
+```c
+drivers/vhost/scsi.c:1270
+			if (prot_bytes) {
+				exp_data_len -= prot_bytes;
+```
+Missing check `if (prot_bytes > exp_data_len)`.
+
+**What’s the fix (high-level)?**
+- Add a check ensuring `prot_bytes <= exp_data_len` before subtraction.
