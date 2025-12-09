@@ -1,0 +1,386 @@
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0001",
+  "title": "Integer Overflow in vhost_vsock_alloc_skb on 32-bit",
+  "concept": "Integer overflow in payload length validation allows 32-bit systems to bypass bounds check, leading to OOB write.",
+  "attacker_model": "container_guest",
+  "preconditions": [
+    "32-bit kernel build (CONFIG_X86_32 or equivalent)",
+    "vhost_vsock enabled",
+    "Guest capable of sending custom virtio descriptors"
+  ],
+  "description": "In `vhost_vsock_alloc_skb`, the check `if (payload_len + sizeof(*hdr) > len)` suffers from integer overflow on 32-bit architectures because `size_t` is 32-bit. If a guest provides a `payload_len` close to `U32_MAX` (e.g. `0xFFFFFFE0`) and `sizeof(*hdr)` is 44, the sum wraps to a small value (e.g. 24). If `len` (from `iov_length`) is greater than 24 (e.g. 64), the check passes. Then `virtio_vsock_skb_put` is called with the huge `payload_len`. `skb_put` advances the tail pointer by a huge amount. Since `tail` + `huge` wraps around the address space, it may result in a pointer smaller than `end`, bypassing `skb_put` assertions. Finally, `skb_copy_datagram_from_iter` writes huge amounts of data to the wrapped memory address, causing a kernel crash (DoS).",
+  "classification": "DoS",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "confirmed_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:453: if (payload_len + sizeof(*hdr) > len)"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Use `check_add_overflow` or cast to `u64` for the addition check to prevent wrap-around on 32-bit systems."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0002",
+  "title": "Host Memory Exhaustion via Unbounded send_pkt_queue",
+  "concept": "Resource exhaustion due to lack of limits on the `send_pkt_queue` allowing a malicious guest to consume host memory.",
+  "attacker_model": "container_guest",
+  "preconditions": [
+    "vhost_vsock enabled"
+  ],
+  "description": "The `send_pkt_queue` in `struct vhost_vsock` buffers packets destined for the guest (Host->Guest). The `virtio_transport` layer (in `net/vmw_vsock/virtio_transport_common.c`) respects the credit advertised by the peer (Guest). If a malicious guest advertises a very large credit window (e.g. 2GB) but refuses to consume packets from the RX virtqueue, the Host will continue to queue packets in `send_pkt_queue` until the credit limit is reached. Since each packet consumes kernel memory (skb + data), a single guest can force the host to allocate gigabytes of memory, potentially triggering the OOM killer and causing a Denial of Service.",
+  "classification": "resource-exhaustion",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "confirmed_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:380: virtio_vsock_skb_queue_tail(&vsock->send_pkt_queue, skb);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Enforce a hard limit on the number of bytes or packets in `send_pkt_queue` per socket or per device, independent of the flow control credit."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0003",
+  "title": "Race Condition in vhost_vsock_dev_release vs vhost_transport_cancel_pkt",
+  "concept": "Potential Use-After-Free due to race between device release and packet cancellation.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`vhost_vsock_dev_release` frees the `vhost_vsock` structure. `vhost_transport_cancel_pkt` (called from socket close) accesses it. `vhost_vsock_get` uses RCU to find the device. `vhost_vsock_dev_release` removes the device from the hash table and calls `synchronize_rcu()` before cleanup. This ensures that any concurrent `cancel_pkt` holding the RCU read lock will complete before the device is freed. This scenario verifies the correctness of the locking scheme.",
+  "classification": "UAF",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:647: synchronize_rcu();"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed; RCU usage is correct."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0004",
+  "title": "Guest CID Spoofing via vhost_vsock_handle_tx_kick",
+  "concept": "Guest impersonation by modifying source CID in packet headers.",
+  "attacker_model": "container_guest",
+  "preconditions": [],
+  "description": "A malicious guest could try to send packets with a spoofed source CID to impersonate another guest. `vhost_vsock_handle_tx_kick` validates that `hdr->src_cid` matches `vsock->guest_cid`. If it does not match, the packet is dropped. This prevents simple spoofing attacks.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:512: if (le64_to_cpu(hdr->src_cid) == vsock->guest_cid ..."
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed; check is present."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0005",
+  "title": "Information Leak via vhost_transport_do_send_pkt Padding",
+  "concept": "Leaking kernel stack/heap data to guest via uninitialized structure padding.",
+  "attacker_model": "container_guest",
+  "preconditions": [],
+  "description": "`vhost_transport_do_send_pkt` copies the `virtio_vsock_hdr` to the guest using `copy_to_iter`. The header is located in `skb->head`. If the header structure contained padding and was not fully initialized, kernel data could leak. However, `struct virtio_vsock_hdr` is packed, containing no padding, preventing this leak.",
+  "classification": "info-leak",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "include/uapi/linux/virtio_vsock.h:37: } __attribute__((packed));"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed; struct is packed."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0006",
+  "title": "Payload Length vs IOV Length Mismatch Logic Bypass",
+  "concept": "Bypassing length checks by providing mismatched descriptor lengths.",
+  "attacker_model": "container_guest",
+  "preconditions": [],
+  "description": "In `vhost_vsock_alloc_skb`, `iov_length` is used to determine the buffer size, while `hdr->len` determines `payload_len`. A check `payload_len + sizeof(*hdr) > len` ensures consistency. However, on 32-bit systems this check is vulnerable to overflow (see Scenario 0001). On 64-bit systems, the check holds. `iov_length` relies on the descriptors provided by the guest, which are validated by `vhost_get_vq_desc` to point to valid memory.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:453: if (payload_len + sizeof(*hdr) > len)"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed on 64-bit."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0007",
+  "title": "Infinite Loop in vhost_transport_do_send_pkt",
+  "concept": "DoS via infinite loop in packet processing worker.",
+  "attacker_model": "container_guest",
+  "preconditions": [],
+  "description": "`vhost_transport_do_send_pkt` processes packets in a loop. A malicious guest could theoretically construct a sequence of events (e.g., partial packets) that causes the loop to never terminate. However, the loop condition `!vhost_exceeds_weight(vq, ++pkts, total_len)` ensures that the loop yields after a fixed amount of work (packets or bytes), preventing a hard lockup.",
+  "classification": "DoS",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:257: } while(likely(!vhost_exceeds_weight(vq, ++pkts, total_len)));"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed; weight check is effective."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0008",
+  "title": "Race Condition in vhost_vsock_start vs vhost_transport_do_send_pkt",
+  "concept": "Race condition where worker thread runs on a stopped device.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`vhost_vsock_start` initializes the device backends and then kicks the work queue. `vhost_vsock_stop` resets the backends to NULL. `vhost_transport_do_send_pkt` checks `vhost_vq_get_backend(vq)` under `vq->mutex`. `vhost_vsock_stop` acquires `vq->mutex` before resetting. This locking ensures that the worker thread either sees the backend as valid or returns early, preventing access to NULL backends.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:113: if (!vhost_vq_get_backend(vq)) goto out;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed; locking is correct."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0009",
+  "title": "CID Hijacking via vhost_vsock_set_cid",
+  "concept": "Taking over another guest's CID to intercept traffic.",
+  "attacker_model": "privileged",
+  "preconditions": ["Host privileges required to call ioctl"],
+  "description": "`vhost_vsock_set_cid` allows changing the CID of a device. It checks `vsock_find_cid` to ensure the new CID is not already in use by another vhost device or the host. This prevents a malicious administrator (or compromised host process) from accidentally causing collisions, but since it requires `open` on the device node, it's primarily a configuration interface. The checks effectively prevent hijacking active CIDs.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:686: if (vsock_find_cid(guest_cid)) return -EADDRINUSE;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0010",
+  "title": "Memory Leak in vhost_vsock_alloc_skb Error Path",
+  "concept": "Leaking SKBs on allocation or copy failure.",
+  "attacker_model": "container_guest",
+  "preconditions": [],
+  "description": "`vhost_vsock_alloc_skb` allocates an skb. If subsequent checks (payload length, `copy_from_iter`, `skb_copy_datagram_from_iter`) fail, it calls `kfree_skb(skb)`. This ensures that failed packet allocations are properly cleaned up and do not leak memory.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:469: kfree_skb(skb); return NULL;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0011",
+  "title": "Use-After-Check in vhost_vsock_set_features",
+  "concept": "Changing features at runtime leading to inconsistent state.",
+  "attacker_model": "privileged",
+  "preconditions": [],
+  "description": "`vhost_vsock_set_features` can be called while the device is running. It updates `vsock->seqpacket_allow`. Packet processing logic in `vhost_transport_do_send_pkt` checks flags in the packet header, not `vsock->seqpacket_allow` directly (except via `af_vsock` setup). While unusual, `vhost` architecture generally allows feature bits to be set, and the driver handles it safely by locking `dev.mutex`.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:719: mutex_lock(&vsock->dev.mutex);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0012",
+  "title": "Double Free in vhost_vsock_dev_open Error Path",
+  "concept": "Double freeing memory during initialization failure.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "If `kmalloc_array` fails in `vhost_vsock_dev_open`, it calls `vhost_vsock_free(vsock)`. `vsock` was allocated with `kvmalloc`. `vhost_vsock_free` calls `kvfree`. This is correct. No other resources (queues, work) are initialized at this point, so no double free occurs.",
+  "classification": "double-free",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:603: goto out; ... out: vhost_vsock_free(vsock);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0013",
+  "title": "Use-After-Free in vhost_poll_queue during Release",
+  "concept": "Accessing polled queue after device cleanup.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`vhost_transport_cancel_pkt` calls `vhost_poll_queue`. If this races with `vhost_vsock_dev_release`, `cancel_pkt` might access the queue of a dying device. However, `synchronize_rcu` in `release` ensures `cancel_pkt` finishes before `vhost_dev_cleanup` destroys the poll structure. Thus, `vhost_poll_queue` always operates on a valid device.",
+  "classification": "UAF",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:647: synchronize_rcu();"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0014",
+  "title": "vhost_vsock_get CID 0 Handling",
+  "concept": "Incorrectly matching uninitialized CID 0.",
+  "attacker_model": "container_guest",
+  "preconditions": [],
+  "description": "`vhost_vsock_get` iterates the hash table. `vsock->guest_cid` is initialized to 0. If a guest sends a packet to CID 0, `vhost_vsock_get` explicitly skips instances with `other_cid == 0`. This prevents matching uninitialized sockets.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:85: if (other_cid == 0) continue;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0015",
+  "title": "Refcount Overflow on queued_replies",
+  "concept": "Overflowing the atomic refcount for queued replies.",
+  "attacker_model": "container_guest",
+  "preconditions": [],
+  "description": "`queued_replies` is an `atomic_t` (32-bit). It is incremented when a reply packet is queued. A malicious guest could trigger 2^32 replies to be queued. However, each reply requires an `sk_buff` allocation. The host would run out of memory (OOM) long before the 32-bit integer wraps, so this turns into a Resource Exhaustion scenario rather than an integer overflow exploit.",
+  "classification": "integer-overflow",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:377: atomic_inc(&vsock->queued_replies);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Memory limits (see Scenario 0002) cover this."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0016",
+  "title": "vhost_vsock_handle_tx_kick Infinite Loop on Error",
+  "concept": "Worker thread stuck in infinite loop if allocation fails.",
+  "attacker_model": "container_guest",
+  "preconditions": [],
+  "description": "If `vhost_vsock_alloc_skb` fails, the loop continues. `pkts` is incremented in the `while` condition. If the guest keeps providing descriptors, the loop will eventually terminate due to `vhost_exceeds_weight`. It does not loop infinitely.",
+  "classification": "DoS",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:502: continue;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0017",
+  "title": "vhost_vsock_dev_release Orphan Reset Race",
+  "concept": "Resetting orphans on a freed socket.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`vhost_vsock_dev_release` calls `vsock_for_each_connected_socket` to reset orphans. `vhost_vsock_reset_orphans` checks if the peer is still valid using `vhost_vsock_get`. Since the device was removed from the hash table earlier in `release`, `vhost_vsock_get` returns NULL, correctly identifying the socket as orphaned and resetting it.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:622: if (vhost_vsock_get(vsk->remote_addr.svm_cid)) return;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0018",
+  "title": "Packet Fragmentation Logic Error",
+  "concept": "Incorrect handling of SEQ_EOM flags during packet fragmentation.",
+  "attacker_model": "container_guest",
+  "preconditions": [],
+  "description": "When `vhost_transport_do_send_pkt` splits a large packet, it clears `VIRTIO_VSOCK_SEQ_EOM` on intermediate fragments and sets it to be restored on the final fragment. The logic modifies the header in the `skb` (which is requeued) and restores it when the final fragment is processed. This ensures the guest sees the correct sequence flags.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:215: hdr->flags &= ~cpu_to_le32(VIRTIO_VSOCK_SEQ_EOM);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0019",
+  "title": "vhost_transport_send_pkt RCU usage",
+  "concept": "Unsafe access to vsock without RCU lock.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`vhost_transport_send_pkt` is called by the vsock core. It must locate the `vhost_vsock` instance. It correctly uses `rcu_read_lock()` and `vhost_vsock_get()`. It holds the RCU lock while queuing the packet and the work item. This guarantees `vsock` remains valid during the operation.",
+  "classification": "UAF",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:364: rcu_read_lock();"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed."
+}
+{
+  "file": "drivers/vhost/vsock.c",
+  "scenario_id": "drivers/vhost/vsock.c-0020",
+  "title": "vhost_vsock_start Error Handling Backend Reset",
+  "concept": "Failing to reset backends on start error.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "If `vhost_vsock_start` fails to initialize a virtqueue, it enters an error path `err_vq`. This path iterates through all queues and resets their backends to NULL. This ensures that a partially initialized device is not left in an inconsistent state where some queues are running and others are not.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vsock.c:565: vhost_vq_set_backend(vq, NULL);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None needed."
+}
