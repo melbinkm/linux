@@ -47,28 +47,27 @@
   "file": "drivers/vhost/scsi.c",
   "scenario_id": "drivers/vhost/scsi.c-0003",
   "title": "Resource Leak in vhost_scsi_target_queue_cmd on Initialization Failure",
-  "concept": "Memory Leak",
+  "concept": "Resource Leak / Logic Error",
   "attacker_model": "local_unprivileged",
   "preconditions": [
     "Race condition or specific state where target_init_cmd fails (e.g. session dying)"
   ],
-  "description": "Vulnerability Path: Setup: Standard IO. Trigger: target_init_cmd fails inside vhost_scsi_target_queue_cmd. Mechanism: vhost_scsi_get_cmd allocates cmd, tag, and inflight ref. vhost_scsi_target_queue_cmd calls target_init_cmd. If it fails, function returns. The allocated cmd resources are never freed, leading to leak of tag, inflight ref, and memory.",
+  "description": "Vulnerability Path: Setup: Standard IO. Trigger: target_init_cmd fails inside vhost_scsi_target_queue_cmd (e.g. due to session teardown race or resource limit). Mechanism: vhost_scsi_get_cmd allocates cmd, tag, and inflight ref. vhost_scsi_target_queue_cmd calls target_init_cmd but IGNORES the return value. If target_init_cmd fails, se_cmd is invalid. The function proceeds to call target_submit_prep. If that fails (or if it succeeds but on a bad se_cmd), the cleanup path might not be correctly invoked or might operate on uninitialized data. Specifically, if target_init_cmd failed to take a session ref or init kref, subsequent cleanup might be skipped or incorrect, causing the vhost_scsi_cmd (and its tag/inflight ref) to be leaked.",
   "classification": "refcount",
   "impact": "DoS",
   "likelihood": "low",
   "verdict": "confirmed_vuln",
   "context": "driver",
   "evidence": [
-    "drivers/vhost/scsi.c:1049: if (rc) return;",
-    "drivers/vhost/scsi.c:1330: vhost_scsi_target_queue_cmd(...);"
+    "drivers/vhost/scsi.c:1330: vhost_scsi_target_queue_cmd calls target_init_cmd without checking return value."
   ],
   "derived_from": [],
-  "proposed_fix_summary": "If target_init_cmd fails, call vhost_scsi_release_cmd_res to free resources."
+  "proposed_fix_summary": "Check return value of target_init_cmd. If failed, call vhost_scsi_release_cmd_res to free vhost resources and return."
 }
 {
   "file": "drivers/vhost/scsi.c",
   "scenario_id": "drivers/vhost/scsi.c-0004",
-  "title": "Potential NULL Pointer Dereference in vhost_scsi_hotplug race",
+  "title": "Potential NULL Dereference in vhost_scsi_hotplug race",
   "concept": "Race Condition",
   "attacker_model": "privileged",
   "preconditions": [
