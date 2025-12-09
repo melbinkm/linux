@@ -1,0 +1,11 @@
+{
+  "file": "drivers/vhost/net.c",
+  "total_scenarios": 20,
+  "confirmed_vulns": 3,
+  "last_scenario_id": "drivers/vhost/net.c-0020",
+  "high_level_findings": [
+    "Permanent TX Queue Stall via Descriptor Leak when Guest sends Invalid Descriptors.",
+    "Zerocopy Descriptor Completion Signal Loss when switching Tx Modes (State Machine Violation).",
+    "Host Process Hang via Zerocopy Reference Pinning (Resource Exhaustion)."
+  ]
+}
