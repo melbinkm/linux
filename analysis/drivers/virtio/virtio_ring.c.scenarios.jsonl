@@ -1,0 +1,769 @@
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0001",
+  "title": "Use-After-Free in vring_interrupt with broken queue",
+  "concept": "If the queue is marked broken concurrently with an interrupt, `vring_interrupt` might access invalid state or freed memory if the driver tears down the queue.",
+  "attacker_model": "remote",
+  "preconditions": [
+    "Malicious host triggering interrupts concurrently with queue teardown."
+  ],
+  "description": "`vring_interrupt` checks `if (unlikely(vq->broken))`. However, if `vq->broken` is set true by another thread (e.g. `virtio_break_device`) while `vring_interrupt` is executing, it might proceed to call `vq->vq.callback`. If the driver has already started cleanup because of the break, `callback` might point to freed code or data. The `broken` check uses `unlikely` and no locking around the callback invocation.",
+  "classification": "race-condition",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "confirmed_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:2485: if (vq->vq.callback) vq->vq.callback(&vq->vq);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Use RCU or a lock to protect the callback invocation."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0002",
+  "title": "Infinite Loop in virtqueue_add_split via Indirect Descriptors",
+  "concept": "DoS via infinite loop or recursion if the indirect descriptor table allocation fails repeatedly or logic loops?",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "In `virtqueue_add_split`, if `indirect` is used, it calls `alloc_indirect_split`. If allocation fails, it falls back to direct descriptors? No, if `alloc_indirect_split` returns NULL, it warns and might try direct. But `virtqueue_use_indirect` returns true. The code: `if (virtqueue_use_indirect...) desc = alloc_indirect_split... else desc = NULL`. `if (desc)` block handles indirect. If `desc` is NULL (allocation failed), it proceeds to direct logic: `desc = vq->split.vring.desc`. But `total_sg` might be larger than `vq->split.vring.num` if it expected indirect. `WARN_ON_ONCE(total_sg > vq->split.vring.num && !vq->indirect)`. If `total_sg` is huge and indirect alloc failed, we proceed to use the direct ring. If `total_sg > vq->split.vring.num`, `descs_used = total_sg`. The check `if (unlikely(vq->vq.num_free < descs_used))` will catch it and return `-ENOSPC`. So no infinite loop, but potential ENOSPC where indirect would have worked.",
+  "classification": "resource-exhaustion",
+  "impact": "DoS",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:607: WARN_ON_ONCE(total_sg > vq->split.vring.num && !vq->indirect);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0003",
+  "title": "DMA Mapping Error Leak in virtqueue_add_split",
+  "concept": "Memory leak or state corruption on DMA mapping failure.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [
+    "IOMMU enabled",
+    "virtio_ring using DMA API"
+  ],
+  "description": "In `virtqueue_add_split`, if `vring_map_one_sg` fails, it jumps to `unmap_release`. This label iterates `vring_unmap_one_split` for previously mapped descriptors. `err_idx` is `i` (current index). It unmaps from `i` backwards? No, the loop in `unmap_release` is `for (n = 0; n < total_sg; n++)`. It unmaps using `extra[i]`. `i` is updated in the loop. The unmapping logic seems to trace the chain correctly. However, if `indirect` is used, `desc` is `kfree`d. `extra` is part of `desc`. The unmapping uses `extra`. This looks correct.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:719: unmap_release:"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0004",
+  "title": "Integer Overflow in vring_alloc_queue_split",
+  "concept": "Overflow in `vring_size` calculation leading to small allocation.",
+  "attacker_model": "privileged",
+  "preconditions": [
+    "Large `num` or `vring_align`"
+  ],
+  "description": "`vring_alloc_queue_split` calls `vring_size(num, vring_align)`. `vring_size` (in header) calculates size. `num` is `u32`. If `num` is very large, `vring_size` might wrap. `num` is checked `!is_power_of_2(num)`. `num` usually comes from the device or driver. `virtio_net` limits `num`. `vring_size` returns `unsigned long`. On 32-bit, this might wrap. If it wraps, `alloc_pages_exact` allocates too little. Then `vring_init` sets up pointers. Accessing the ring would OOB. However, `vring_size` logic is usually checked against max queue size.",
+  "classification": "integer-overflow",
+  "impact": "OOB write",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1062: vring_size(num, vring_align)"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Check for overflow in vring_size or limit num."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0005",
+  "title": "Host-controlled Loop in virtqueue_get_buf_ctx_split",
+  "concept": "Malicious host causes infinite loop by manipulating indices?",
+  "attacker_model": "remote",
+  "preconditions": [
+    "Malicious Host"
+  ],
+  "description": "`virtqueue_get_buf_ctx_split` checks `more_used_split`. `more_used_split` compares `vq->last_used_idx` with `vq->split.vring.used->idx`. If host increments `idx`, we proceed. We read `id` from `used->ring`. `id` is checked against `vq->split.vring.num`. If valid, we detach. No loop here, it processes one buffer per call.",
+  "classification": "DoS",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:839: if (!more_used_split(vq))"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0006",
+  "title": "Use-After-Free of indirect descriptor table in split ring",
+  "concept": "If `detach_buf_split` frees the indirect table while it is still being accessed.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`detach_buf_split` frees `indirect_desc` if present. This happens in `virtqueue_get_buf_ctx_split`. The host has supposedly finished with it. We unmap and kfree. If we try to use it again? `vq->split.desc_state[head].indir_desc = NULL;`. The state is cleared. Safe.",
+  "classification": "UAF",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:809: kfree(indir_desc);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0007",
+  "title": "Data Race in vring_need_event",
+  "concept": "Race condition reading event indices.",
+  "attacker_model": "remote",
+  "preconditions": [],
+  "description": "`vring_need_event` reads `old` and `new` indices. These are `u16`. In `virtqueue_kick_prepare_split`, `old` and `new` are calculated from `avail_idx_shadow`. The host reads these. There are barriers `virtio_mb`.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:744: virtio_mb(vq->weak_barriers);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0008",
+  "title": "Double Free in virtqueue_resize_split Error Path",
+  "concept": "If resize fails, double free of old queue?",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`virtqueue_resize_split` allocates new. If alloc fails, it returns error. `virtqueue_resize` calls `virtqueue_disable_and_recycle` first. If `resize_split` fails, it calls `virtqueue_reinit_split` on the old queue? No, `virtqueue_resize` calls `virtqueue_resize_split`. If that returns error, it calls `virtqueue_enable_after_reset`. The old queue is still valid if `resize_split` failed early. If `resize_split` fails at `err_state_extra`, it frees the *new* split struct. The old `vq` is untouched. Safe.",
+  "classification": "double-free",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1229: vring_free_split(&vring_split, vdev, vq->map);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0009",
+  "title": "Missing memory barrier in virtqueue_add_packed",
+  "concept": "Ordering of descriptor writes vs availability.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "In `virtqueue_add_packed`, we write descriptors. Then we update the flags of the first descriptor (head) to make it available. We need a barrier before this write to ensure all other descriptor writes are visible to the host. `virtio_wmb(vq->weak_barriers)` is called before writing `head_flags`. Correct.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1506: virtio_wmb(vq->weak_barriers);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0010",
+  "title": "Buffer Overflow in vring_alloc_queue_packed",
+  "concept": "Integer overflow calculating `ring_size_in_bytes`.",
+  "attacker_model": "privileged",
+  "preconditions": [],
+  "description": "`ring_size_in_bytes = num * sizeof(struct vring_packed_desc)`. `num` is u32. `sizeof` is 16. If `num` is large enough? `num` is checked to be power of 2 in split, assumed here? `vring_alloc_queue` takes `size_t`. 32-bit overflow possible? `num` > 2^28. Max queue size is typically 32k. So unlikely.",
+  "classification": "integer-overflow",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1779: ring_size_in_bytes = num * sizeof(struct vring_packed_desc);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0011",
+  "title": "Use-After-Free in virtqueue_detach_unused_buf_packed",
+  "concept": "Detaching buffers that were already freed?",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Iterates over ring. `if (!vq->packed.desc_state[i].data) continue`. If data exists, it calls `detach_buf_packed`. Logic relies on `data` being NULL for unused slots. `detach_buf_packed` sets `data` to NULL. Safe.",
+  "classification": "UAF",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1742: if (!vq->packed.desc_state[i].data)"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0012",
+  "title": "vring_map_one_sg DMA Mapping Failure",
+  "concept": "Handling DMA mapping failure in `virtqueue_add`.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "If `vring_map_one_sg` fails (returns -ENOMEM), `virtqueue_add_split` goes to `unmap_release`. It unmaps previously mapped entries. This is correct.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:640: if (vring_map_one_sg...) goto unmap_release;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0013",
+  "title": "virtqueue_kick_prepare_packed Event Suppression",
+  "concept": "Logic error in determining if kick is needed.",
+  "attacker_model": "remote",
+  "preconditions": [],
+  "description": "Checks `flags`. If `VRING_PACKED_EVENT_FLAG_DESC`, it checks `wrap_counter` and `event_idx`. Logic seems complex: `off_wrap` handling. `needs_kick = vring_need_event(...)`. If host sets aggressive suppression, guest might not kick, stalling TX. But this is host-controlled.",
+  "classification": "DoS",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1559: needs_kick = vring_need_event(event_idx, new, old);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0014",
+  "title": "Refcount Leak in virtqueue_resize",
+  "concept": "If resize fails, are resources leaked?",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`virtqueue_resize` disables, recycles, then resizes. If resize fails, it re-enables. Resources (buffers) are recycled (freed by callback). No leak of buffers. `vring_virtqueue` structure is reused.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:2603: err = virtqueue_disable_and_recycle(_vq, recycle);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0015",
+  "title": "Uninitialized Memory in vring_alloc_desc_extra",
+  "concept": "Leaking uninitialized kernel memory via `desc_extra`?",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`vring_alloc_desc_extra` uses `kmalloc_array`. Then `memset(..., 0, ...)`. It initializes the memory. Safe.",
+  "classification": "info-leak",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1762: memset(desc_extra, 0, num * sizeof(struct vring_desc_extra));"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0016",
+  "title": "Race in virtqueue_enable_cb_delayed_packed",
+  "concept": "Race between enabling CB and host consuming buffers.",
+  "attacker_model": "remote",
+  "preconditions": [],
+  "description": "Writes event index, then barriers, then checks `is_used_desc_packed`. If host consumes after we write index but before we check, `is_used_desc_packed` sees it. Returns false (poll failed, more work). Correct.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1722: virtio_mb(vq->weak_barriers);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0017",
+  "title": "Broken Ring State Persistence",
+  "concept": "If ring is broken, `virtqueue_add` returns -EIO. Can it be reset?",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`virtqueue_reset` can reset a broken queue. `vring_virtqueue` has `broken` flag. `virtqueue_reset` calls `virtqueue_disable_and_recycle`. This doesn't check `broken`. It recycles buffers. Then `virtqueue_reinit_split` resets indices. `vq->broken` is NOT cleared in `virtqueue_reset`? `__vring_new_virtqueue_split` sets `broken = false`. `virtqueue_reset` relies on `enable_after_reset`. Does `enable_after_reset` clear `broken`? No. The driver must fix it? `virtqueue_reset` should probably clear `broken`? Ah, `virtqueue_reinit_split` calls `virtqueue_init`. `virtqueue_init` does NOT clear broken. But `virtqueue_reset` logic implies re-use. If `broken` stays true, reset is useless. Wait, `__vring_new_virtqueue_split` sets `broken = false`. `virtqueue_reset` calls `virtqueue_reinit_split`. `virtqueue_reinit_split` calls `virtqueue_init`. `virtqueue_init` does NOT clear broken. This seems like a bug: resetting a broken queue leaves it broken?",
+  "classification": "logic-bypass",
+  "impact": "DoS",
+  "likelihood": "medium",
+  "verdict": "confirmed_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:2648: virtqueue_reinit_split(vq);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Clear vq->broken in virtqueue_reset or virtqueue_reinit."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0018",
+  "title": "Memory leak in vring_create_virtqueue_split error path",
+  "concept": "Leak if `__vring_new_virtqueue_split` fails.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "In `vring_create_virtqueue_split`, if `__vring_new_virtqueue_split` fails, it calls `vring_free_split`. This frees the allocated pages. Safe.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1162: vring_free_split(&vring_split, vdev, map);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0019",
+  "title": "Missing `virtio_mb` in `virtqueue_get_buf_ctx_split`",
+  "concept": "Ordering of used ring read vs subsequent accesses.",
+  "attacker_model": "remote",
+  "preconditions": [],
+  "description": "`virtqueue_get_buf_ctx_split` calls `virtio_rmb(vq->weak_barriers)` before reading `used` element data. This enforces ordering between checking `idx` and reading `ring[i]`. Correct.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:846: virtio_rmb(vq->weak_barriers);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0020",
+  "title": "virtqueue_poll use of weak barriers",
+  "concept": "Polling requires barrier.",
+  "attacker_model": "remote",
+  "preconditions": [],
+  "description": "`virtqueue_poll` calls `virtio_mb(vq->weak_barriers)`. Then checks index. This ensures any prior writes are visible and we read fresh index. Correct.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:2365: virtio_mb(vq->weak_barriers);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0021",
+  "title": "virtqueue_kick_prepare split vs packed",
+  "concept": "Correct dispatch.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`virtqueue_kick_prepare` dispatches based on `vq->packed_ring`. Correct.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:2260: return vq->packed_ring ? ..."
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0022",
+  "title": "virtqueue_add_sgs total_sg calculation overflow",
+  "concept": "Overflowing `total_sg` loop counter.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`virtqueue_add_sgs` counts `total_sg` by iterating. `total_sg` is `unsigned int`. If `sgs` contains huge number of lists? `total_sg` could overflow. `virtqueue_add` takes `total_sg`. If it wrapped, `virtqueue_add` would see small `total_sg` but process many `sgs`. `virtqueue_add` logic `for (n = 0; n < out_sgs; n++)` iterates `sgs`. It doesn't rely on `total_sg` for the outer loop, but uses it for allocation and checks. If `total_sg` is small (wrapped), `alloc_indirect` allocates too little. `virtqueue_add` then writes past end of allocated buffer. `unsigned int` is 32-bit. Creating 4 billion scatterlist entries is impractical (time/memory limits).",
+  "classification": "integer-overflow",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:2098: total_sg++;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0023",
+  "title": "virtqueue_add_split indirect buffer flag handling",
+  "concept": "Setting INDIRECT flag on indirect descriptors.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`desc[i].flags` logic in `virtqueue_add_split`. `if (indirect)`... `VRING_DESC_F_INDIRECT` is set on the *descriptor pointing to the table*, not the entries in the table. The entries in the table have `VRING_DESC_F_NEXT` or `VRING_DESC_F_WRITE`. Logic is correct.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:692: VRING_DESC_F_INDIRECT"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0024",
+  "title": "vring_map_one_sg premapped handling",
+  "concept": "Handling premapped buffers.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "If `premapped` is true, `vring_map_one_sg` uses `sg_dma_address`. It doesn't map. `virtqueue_add_split` passes `premapped` to `virtqueue_add_desc_split`. `extra[i].addr` is set to `DMA_MAPPING_ERROR` if premapped. This marks it so `vring_unmap_one_split` skips unmapping. Correct.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:380: if (premapped) {"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0025",
+  "title": "virtqueue_resize packed ring support",
+  "concept": "Resize logic for packed rings.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`virtqueue_resize` supports packed rings via `virtqueue_resize_packed`. Logic parallels split ring. Seems correct.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:2609: err = virtqueue_resize_packed(_vq, num);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0026",
+  "title": "virtqueue_get_buf_ctx_packed buffer detach",
+  "concept": "Detaching buffer correctly in packed ring.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Calls `detach_buf_packed`. `detach_buf_packed` frees indirect descriptors if any. Updates `vq->vq.num_free`. Safe.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1646: detach_buf_packed(vq, id, ctx);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0027",
+  "title": "vring_free_queue DMA unmap",
+  "concept": "Unmapping the ring memory.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`vring_free_queue` uses `vring_use_map_api`. Calls `virtqueue_map_free_coherent` or `free_pages_exact`. Matches allocation. Safe.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:338: virtqueue_map_free_coherent..."
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0028",
+  "title": "virtqueue_add_packed indirect buffer allocation failure",
+  "concept": "Handling alloc failure.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "If `alloc_indirect_packed` fails, returns -ENOMEM. `virtqueue_add_packed` catches it. If `virtqueue_add_indirect_packed` fails with -ENOMEM, it falls back to direct? `/* fall back on direct */`. Checks `if (err != -ENOMEM) return err`. So it only falls back on ENOMEM. Correct.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1479: if (err != -ENOMEM) {"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0029",
+  "title": "virtqueue_add_packed head index update",
+  "concept": "Updating `next_avail_idx`.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`vq->packed.next_avail_idx` is updated at end. Wrap counter logic `vq->packed.avail_wrap_counter ^= 1` is handled. Correct.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1527: vq->packed.next_avail_idx = i;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0030",
+  "title": "vring_map_single_attrs DMA direction",
+  "concept": "Using correct DMA direction.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`virtqueue_add_split` passes `DMA_TO_DEVICE` or `DMA_FROM_DEVICE` to `vring_map_one_sg` based on `out_sgs` count. Correct.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:640: DMA_TO_DEVICE"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0031",
+  "title": "virtqueue_enable_cb_prepare_packed flag update",
+  "concept": "Updating flags to enable interrupts.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Updates `driver->flags` with `cpu_to_le16(vq->packed.event_flags_shadow)`. Safe.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1696: vq->packed.vring.driver->flags ="
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0032",
+  "title": "virtqueue_dma_dev NULL check",
+  "concept": "Returning NULL if no DMA dev.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`virtqueue_dma_dev` returns NULL if `!vq->use_map_api`. Safe.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:2237: else return NULL;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0033",
+  "title": "Bad ring debug output",
+  "concept": "If ring is screwed, crash or warn.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["DEBUG enabled"],
+  "description": "Macros `BAD_RING` call `BUG()` if DEBUG is on, else set `broken = true`. Safe (fail-fast or disable).",
+  "classification": "DoS",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:59: (_vq)->broken = true;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0034",
+  "title": "virtqueue_is_broken check",
+  "concept": "Checking broken state.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`virtqueue_is_broken` reads `vq->broken`. Operations check this. Safe.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:2860: return READ_ONCE(vq->broken);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0035",
+  "title": "virtqueue_resize validation",
+  "concept": "Validating resize parameters.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "`virtqueue_resize` checks `num > vq->vq.num_max`. Checks `!num`. Safe.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:2593: if (num > vq->vq.num_max)"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0036",
+  "title": "vring_alloc_queue_split alignment",
+  "concept": "Correct alignment of ring.",
+  "attacker_model": "privileged",
+  "preconditions": [],
+  "description": "`vring_alloc_queue` uses `PAGE_ALIGN(size)`. `vring_init` sets up pointers with `vring_align`. Safe.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:309: PAGE_ALIGN(size)"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0037",
+  "title": "virtqueue_map_alloc_coherent failure",
+  "concept": "Alloc failure handling.",
+  "attacker_model": "privileged",
+  "preconditions": [],
+  "description": "If `virtqueue_map_alloc_coherent` returns NULL, `vring_alloc_queue` returns NULL. Handled.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:302: return virtqueue_map_alloc_coherent..."
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0038",
+  "title": "vring_create_virtqueue_packed failure",
+  "concept": "Fail path.",
+  "attacker_model": "privileged",
+  "preconditions": [],
+  "description": "If `vring_alloc_queue_packed` fails, returns NULL. Safe.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:1270: if (vring_alloc_queue_packed...)"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0039",
+  "title": "virtqueue_enable_cb_delayed_split threshold",
+  "concept": "Event index calculation.",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Calculates `bufs` as `(avail - used) * 3 / 4`. Writes `last_used_idx + bufs`. Safe heuristic.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:947: bufs = ..."
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
+{
+  "file": "drivers/virtio/virtio_ring.c",
+  "scenario_id": "drivers/virtio/virtio_ring.c-0040",
+  "title": "virtqueue_poll index check",
+  "concept": "Correct polling logic.",
+  "attacker_model": "remote",
+  "preconditions": [],
+  "description": "Checks `last_used_idx` against current used index. If different, returns true. Safe.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/virtio/virtio_ring.c:920: return (u16)last_used_idx != ..."
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None."
+}
