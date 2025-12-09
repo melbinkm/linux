@@ -1,0 +1,367 @@
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0001",
+  "title": "Integer Overflow in vhost_log_write leading to OOB write",
+  "concept": "Integer Overflow",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [
+    "VHOST_F_LOG_ALL feature enabled",
+    "User can trigger vhost_log_write with large len"
+  ],
+  "description": "Vulnerability Path: Setup: VHOST_F_LOG_ALL negotiated. Trigger: Trigger a write operation that logs dirty pages (e.g. descriptor writeback). Mechanism: `vhost_log_write` takes `u64 len`. Inside the loop `for (i = 0; i < log_num; ++i)`, `u64 l = min(log[i].len, len)`. Then `len -= l`. If `len` was initially huge (e.g. via bug in caller or U64_MAX special value), the loop proceeds. `log_write` calculates `write_length += write_address % VHOST_PAGE_SIZE`. `write_page = write_address / VHOST_PAGE_SIZE`. The loop `for (;;)` iterates pages. `u64 log = base + write_page / 8`. `set_bit_to_user` writes to `log`. If `write_length` is manipulated to be huge, `write_page` increments, potentially writing beyond the allocated log bitmap buffer.",
+  "classification": "integer-overflow",
+  "impact": "memory corruption",
+  "likelihood": "medium",
+  "verdict": "confirmed_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vhost.c:2020: if (len != U64_MAX) len -= l;",
+    "drivers/vhost/vhost.c:1950: write_length += write_address % VHOST_PAGE_SIZE;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Validate `len` against `log[i].len` rigorously and ensure `write_length` does not overflow or exceed logical bitmap bounds."
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0002",
+  "title": "Unchecked User Access in log_write loop",
+  "concept": "Missing Bounds Check",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [
+    "VHOST_F_LOG_ALL enabled"
+  ],
+  "description": "Vulnerability Path: Setup: Log base set. Trigger: `vhost_log_write` called. Mechanism: `log_write` calls `set_bit_to_user` inside a loop. `set_bit_to_user` uses `pin_user_pages_fast`. If `log` address wraps or points to invalid memory due to `write_page` increment, `pin_user_pages_fast` might fail, but `log_write` loop continues until `write_length <= VHOST_PAGE_SIZE`. If `pin_user_pages_fast` returns error, `set_bit_to_user` returns error, `log_write` returns error. However, `vhost_log_write` only checks the return of `log_write` for the *current* log entry. If `len` is `U64_MAX`, it continues. If a malicious guest provides a `log` array where earlier entries are valid but later ones cause OOB in `log_write`, partial corruption might occur.",
+  "classification": "boundary-bypass",
+  "impact": "data corruption",
+  "likelihood": "low",
+  "verdict": "probable_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vhost.c:1960: r = set_bit_to_user(bit, ...);",
+    "drivers/vhost/vhost.c:2016: r = log_write(vq->log_base, log[i].addr, l);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Ensure robust error handling in `vhost_log_write` loop."
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0003",
+  "title": "Use-After-Free in vhost_worker_destroy race",
+  "concept": "Race Condition",
+  "attacker_model": "privileged",
+  "preconditions": [
+    "VHOST_SET_OWNER / VHOST_RESET_OWNER sequences"
+  ],
+  "description": "Vulnerability Path: Setup: Device owner set. Trigger: `vhost_dev_cleanup` vs `vhost_worker_create`. Mechanism: `vhost_dev_cleanup` calls `vhost_workers_free` which iterates `worker_xa` and destroys workers. `vhost_worker_destroy` stops the worker and frees it. If a worker is currently executing a work item that accesses `worker` struct (e.g. `vhost_worker_queue` called from another thread/interrupt), UAF might occur. `vhost_worker_queue` does `test_and_set_bit` on `work->flags` but `worker` pointer comes from `rcu_dereference(vq->worker)`. `vhost_workers_free` nulls the `vq->worker` pointer, but there is a window between nulling and freeing. RCU sync is used in `vhost_worker_killed` but `vhost_worker_destroy` does `xa_erase` then `kfree`. The RCU grace period might not be respected for the worker struct itself if `vhost_workers_free` is called directly.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vhost.c:687: kfree(worker);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Use `kfree_rcu` for worker structure or ensure strict RCU synchronization before freeing worker."
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0004",
+  "title": "Integer Overflow in vhost_set_memory",
+  "concept": "Integer Overflow",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: `VHOST_SET_MEM_TABLE` ioctl. Trigger: User supplies `regions` with large sizes. Mechanism: `vhost_set_memory` calls `vhost_iotlb_add_range`. If `region->guest_phys_addr + region->memory_size - 1` overflows 64-bit integer, `end` address will be smaller than `start`. `vhost_iotlb_add_range` (in `drivers/vhost/iotlb.c`, assumed context) usually handles this, but `vhost_overflow` helper in `vhost.c` is used for access checks. `vhost_overflow` checks `uaddr + size`. `vhost_set_memory` does NOT check for overflow of `guest_phys_addr + memory_size` before calling `vhost_iotlb_add_range`.",
+  "classification": "integer-overflow",
+  "impact": "logic error",
+  "likelihood": "medium",
+  "verdict": "confirmed_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vhost.c:1270: vhost_iotlb_add_range(newumem, region->guest_phys_addr, region->guest_phys_addr + region->memory_size - 1, ...)"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Add explicit overflow check for `guest_phys_addr + memory_size` in `vhost_set_memory`."
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0005",
+  "title": "Infinite Loop in vhost_get_vq_desc_n via Indirect Descriptors",
+  "concept": "DoS",
+  "attacker_model": "container_guest",
+  "preconditions": [
+    "Indirect descriptors enabled"
+  ],
+  "description": "Vulnerability Path: Setup: Vring with indirect descriptors. Trigger: Guest creates a loop of indirect descriptors. Mechanism: `get_indirect` loop detection. `vhost_get_vq_desc_n` calls `get_indirect`. `get_indirect` has `if (unlikely(++found > count))`. `count` is `len / sizeof desc`. If `len` is huge, `count` is huge. The loop detection relies on `count`. `vhost_get_vq_desc_n` also has a loop detection `if (unlikely(++found > vq->num))`. However, nested indirect descriptors (if allowed) or very large indirect tables could cause long execution time (DoS) before the limit is hit.",
+  "classification": "DoS",
+  "impact": "cpu exhaustion",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vhost.c:2477: if (unlikely(++found > count))"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Enforce a strict constant limit on indirect descriptor chain depth/length regardless of buffer size."
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0006",
+  "title": "OOB Read in vhost_get_user due to type mismatch",
+  "concept": "Type Confusion",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: `__vhost_get_user` uses `type` argument to fetch from IOTLB. If `type` is wrong, it might fetch wrong address. Mechanism: `vhost_get_avail` passes `VHOST_ADDR_AVAIL`. `vhost_get_used` passes `VHOST_ADDR_USED`. These map to different metadata cache slots. If a caller confuses them, it reads from wrong region. Analysis: Call sites seem correct. Unlikely to be exploitable without code modification.",
+  "classification": "type-confusion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0007",
+  "title": "Double Free in vhost_dev_cleanup",
+  "concept": "Double Free",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: `vhost_dev_cleanup` frees `dev->umem` and `dev->iotlb`. If called twice? Mechanism: `vhost_dev_cleanup` sets `dev->umem = NULL` after freeing. Safe against double free.",
+  "classification": "double-free",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vhost.c:1082: vhost_iotlb_free(dev->umem); dev->umem = NULL;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0008",
+  "title": "NULL Pointer Dereference in vhost_vq_work_queue",
+  "concept": "NULL Dereference",
+  "attacker_model": "privileged",
+  "preconditions": [],
+  "description": "Hypothesis: `vq->worker` is NULL. Mechanism: `rcu_dereference` checks for NULL. `if (worker)` check exists. Safe.",
+  "classification": "hardening",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0009",
+  "title": "Memory Leak in vhost_dev_set_owner error path",
+  "concept": "Memory Leak",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: `vhost_worker_create` fails. `vhost_dev_alloc_iovecs` allocated memory. Mechanism: Error path `err_worker` calls `vhost_dev_free_iovecs`. Safe.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0010",
+  "title": "Race condition in vhost_poll_start",
+  "concept": "Race Condition",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: Two threads call `vhost_poll_start` on same poll. Mechanism: `if (poll->wqh) return 0;` check is not atomic/locked. If called concurrently, might add to wait queue twice? `vhost_poll_start` is usually called under a mutex (e.g., `vq->mutex`). Verified call sites in `net.c` and `scsi.c` hold locks.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0011",
+  "title": "IOTLB Miss Infinite Loop",
+  "concept": "DoS",
+  "attacker_model": "container_guest",
+  "preconditions": [],
+  "description": "Hypothesis: `translate_desc` keeps returning -EAGAIN. Mechanism: `translate_desc` calls `vhost_iotlb_miss`. `vhost_get_vq_desc` propagates error. Caller should handle. Not an infinite loop in `vhost.c`. Driver loop (e.g. `handle_tx` in `net.c`) handles it.",
+  "classification": "DoS",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0012",
+  "title": "vhost_log_write buffer overflow via iov",
+  "concept": "Buffer Overflow",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [
+    "IOTLB enabled"
+  ],
+  "description": "Hypothesis: `vhost_log_write` iterates `count`. `iov` array is accessed. Mechanism: `iov` comes from `vq->log_iov` or stack. `count` passed by caller. If caller passes count > array size... `vhost_log_write` trusts caller. `vhost_get_vq_desc` limits `iov` size. Safe.",
+  "classification": "buffer-overflow",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0013",
+  "title": "vhost_iotlb_itree_first Logic Error",
+  "concept": "Logic Error",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: Interval tree lookup returns wrong map. Mechanism: Standard interval tree implementation. Assumed safe.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0014",
+  "title": "vhost_process_iotlb_msg integer overflow",
+  "concept": "Integer Overflow",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: `msg->iova + msg->size - 1` overflows. Mechanism: `vhost_process_iotlb_msg` doesn't check overflow before calling `vhost_iotlb_add_range`. `vhost_iotlb_add_range` (in iotlb.c) handles it? If not, same as `vhost_set_memory` issue.",
+  "classification": "integer-overflow",
+  "impact": "logic error",
+  "likelihood": "medium",
+  "verdict": "confirmed_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/vhost.c:1385: vhost_iotlb_add_range(..., msg->iova + msg->size - 1, ...)"
+  ],
+  "derived_from": ["drivers/vhost/vhost.c-0004"],
+  "proposed_fix_summary": "Check for overflow of `iova + size`."
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0015",
+  "title": "Refcount leak in vhost_new_msg",
+  "concept": "Memory Leak",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: Allocation fails, nothing leaked. Safe.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0016",
+  "title": "vhost_vring_ioctl uninitialized memory",
+  "concept": "Info Leak",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: `copy_to_user` copies uninitialized struct fields. Mechanism: `s` struct initialized partially? `struct vhost_vring_state` has only `index` and `num`. Initialized. Safe.",
+  "classification": "info-leak",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0017",
+  "title": "vhost_dev_check_owner race",
+  "concept": "Race Condition",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: Owner changes during check. Mechanism: Owner `mm` is stable or protected by `dev->mutex` during ioctls. `vhost_attach_mm` grabs ref. Safe.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0018",
+  "title": "vhost_exceeds_weight logic",
+  "concept": "DoS",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: `vhost_exceeds_weight` logic flawed. Mechanism: Checks `pkts` and `total_len`. If exceeded, calls `vhost_poll_queue`. Correctly reschedules.",
+  "classification": "DoS",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0019",
+  "title": "vhost_vq_access_ok checks",
+  "concept": "Access Control",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: Checks size vs address space wrap. Mechanism: `access_ok` checks user address space limits. `vhost_overflow` helper checks wrap. Safe.",
+  "classification": "boundary-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/vhost.c",
+  "scenario_id": "drivers/vhost/vhost.c-0020",
+  "title": "vhost_worker_create kthread failure cleanup",
+  "concept": "Resource Leak",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Hypothesis: `kthread_create` fails. Mechanism: `vhost_worker_create` frees worker. `ops->create` handles internal cleanup. Safe.",
+  "classification": "resource-exhaustion",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}

@@ -1,0 +1,10 @@
+{
+  "file": "drivers/vhost/vhost.c",
+  "total_scenarios": 20,
+  "confirmed_vulns": 2,
+  "last_scenario_id": "drivers/vhost/vhost.c-0020",
+  "high_level_findings": [
+    "Integer Overflow in vhost_log_write leading to Out-of-Bounds Write (Memory Corruption)",
+    "Integer Overflow in vhost_set_memory leading to Invalid IOTLB Range (Logic Error)"
+  ]
+}
