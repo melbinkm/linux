@@ -5,8 +5,6 @@
   "last_scenario_id": "drivers/vhost/vsock.c-0020",
   "high_level_findings": [
     "Confirmed Integer Overflow in `vhost_vsock_alloc_skb` leading to DoS on 32-bit architectures.",
-    "Confirmed Resource Exhaustion (DoS) due to unbounded `send_pkt_queue` growth if guest manipulates credit window.",
-    "Analyzed race conditions in setup/teardown paths (release vs cancel_pkt, start vs worker) and found locking/RCU usage to be robust.",
-    "Verified packet handling logic (splitting, header parsing) against type confusion and logic errors."
+    "Confirmed Resource Exhaustion (DoS) due to unbounded `send_pkt_queue` growth if guest manipulates credit window."
   ]
 }
