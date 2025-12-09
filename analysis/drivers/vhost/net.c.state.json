@@ -1,0 +1,12 @@
+{
+  "file": "drivers/vhost/net.c",
+  "total_scenarios": 100,
+  "confirmed_vulns": 4,
+  "last_scenario_id": "drivers/vhost/net.c-0100",
+  "high_level_findings": [
+    "Confirmed Use-After-Free in failure path of `vhost_net_set_backend` due to improper pointer restoration.",
+    "Probable Integer Overflow in `vhost_net_build_xdp` length calculation leading to heap OOB write.",
+    "Confirmed Denial of Service via Zerocopy Descriptor Completion Signal Loss leading to persistent stall.",
+    "Confirmed Host Process Hang via Zerocopy Reference Pinning causing unkillable process state."
+  ]
+}
