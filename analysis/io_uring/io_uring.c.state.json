@@ -1,0 +1,12 @@
+{
+  "file": "io_uring/io_uring.c",
+  "total_scenarios": 100,
+  "confirmed_vulns": 2,
+  "last_scenario_id": "io_uring/io_uring.c-0100",
+  "high_level_findings": [
+    "Confirmed Resource Exhaustion (DoS) via Atomic Memory Depletion in CQ Overflow path.",
+    "Confirmed Resource Exhaustion (DoS) via io_msg_ring flooding leading to atomic exhaustion.",
+    "Investigated Double Free in allocation error path (proved safe).",
+    "Investigated Integer Overflows in ring sizing (proved safe)."
+  ]
+}
