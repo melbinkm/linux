@@ -1,0 +1,362 @@
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0001",
+  "title": "Guest I/O Stall via Weight Limit in vhost_scsi_handle_vq",
+  "concept": "DoS / Deadlock",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [
+    "Guest has access to virtio-scsi device",
+    "Guest can fill virtqueue > 256 entries"
+  ],
+  "description": "Vulnerability Path: Setup: Host loads vhost_scsi. Guest connects. Trigger: Guest fills virtqueue with > 256 requests (VHOST_SCSI_WEIGHT) and kicks. Mechanism: vhost_scsi_handle_vq processes 256 requests. The loop checks vhost_exceeds_weight, which returns true. The function exits without checking if more work is pending in the ring and without calling vhost_poll_queue/re-arming the poll. The worker thread goes to sleep. If the guest is waiting for completions before kicking again (e.g., ring full), the system stalls indefinitely.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "confirmed_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/scsi.c:1342: do { ... } while (likely(!vhost_exceeds_weight(vq, ++c, 0)));",
+    "drivers/vhost/scsi.c:1344: mutex_unlock(&vq->mutex); (Function returns)"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "In vhost_scsi_handle_vq, if the loop exits due to weight limit, check if there are still pending descriptors. If so, call vhost_poll_queue to reschedule the work item."
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0002",
+  "title": "Host Memory Exhaustion via Integer Underflow in exp_data_len",
+  "concept": "Resource Exhaustion / OOM",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [
+    "T10_PI enabled (VIRTIO_SCSI_F_T10_PI)",
+    "Guest controls pi_bytesout"
+  ],
+  "description": "Vulnerability Path: Setup: T10_PI feature negotiated. Trigger: Guest sends a request with pi_bytesout set to a value slightly larger than exp_data_len. Mechanism: In vhost_scsi_handle_vq, 'exp_data_len -= prot_bytes' underflows to a huge 32-bit integer. iov_iter_truncate takes u64, so it accepts huge value. iov_iter_advance advances data_iter past end (size_t). vhost_scsi_mapal passes empty data_iter to target core. target_submit maps it. In transport_generic_new_cmd, target core sees huge data_length and allocates huge SGL buffer via target_alloc_sgl, triggering OOM.",
+  "classification": "resource-exhaustion",
+  "impact": "DoS",
+  "likelihood": "medium",
+  "verdict": "confirmed_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/scsi.c:1229: exp_data_len -= prot_bytes;"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "Check if prot_bytes > exp_data_len before subtraction in vhost_scsi_handle_vq."
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0003",
+  "title": "Resource Leak in vhost_scsi_target_queue_cmd on Initialization Failure",
+  "concept": "Memory Leak",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [
+    "Race condition or specific state where target_init_cmd fails (e.g. session dying)"
+  ],
+  "description": "Vulnerability Path: Setup: Standard IO. Trigger: target_init_cmd fails inside vhost_scsi_target_queue_cmd. Mechanism: vhost_scsi_get_cmd allocates cmd, tag, and inflight ref. vhost_scsi_target_queue_cmd calls target_init_cmd. If it fails, function returns. The allocated cmd resources are never freed, leading to leak of tag, inflight ref, and memory.",
+  "classification": "refcount",
+  "impact": "DoS",
+  "likelihood": "low",
+  "verdict": "confirmed_vuln",
+  "context": "driver",
+  "evidence": [
+    "drivers/vhost/scsi.c:1049: if (rc) return;",
+    "drivers/vhost/scsi.c:1330: vhost_scsi_target_queue_cmd(...);"
+  ],
+  "derived_from": [],
+  "proposed_fix_summary": "If target_init_cmd fails, call vhost_scsi_release_cmd_res to free resources."
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0004",
+  "title": "Potential NULL Pointer Dereference in vhost_scsi_hotplug race",
+  "concept": "Race Condition",
+  "attacker_model": "privileged",
+  "preconditions": [
+    "Concurrent hotplug and endpoint clear"
+  ],
+  "description": "Vulnerability Path: Setup: Endpoint set. Trigger: Concurrent vhost_scsi_port_link and vhost_scsi_clear_endpoint. Mechanism: vhost_scsi_port_link calls vhost_scsi_hotplug which dereferences tpg->vhost_scsi. vhost_scsi_clear_endpoint clears this pointer. Although tpg->tv_tpg_mutex is held, careful inspection of lock order and checking is required.",
+  "classification": "race-condition",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "Ensure tpg->vhost_scsi is checked under lock."
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0005",
+  "title": "Use of Global Variable vhost_scsi_inline_sg_cnt without Lock",
+  "concept": "Race Condition",
+  "attacker_model": "privileged",
+  "preconditions": [
+    "Module parameter change during device initialization"
+  ],
+  "description": "Vulnerability Path: Setup: Open vhost-scsi. Trigger: Write to /sys/module/vhost_scsi/parameters/inline_sg_cnt during open. Mechanism: vhost_scsi_open reads global vhost_scsi_inline_sg_cnt. If it changes, race is benign but could be inconsistent. Not a vulnerability.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0006",
+  "title": "Invalid LUN DoS via Target Core Interaction",
+  "concept": "Subsystem Interaction",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [
+    "Guest sends command to non-existent LUN"
+  ],
+  "description": "Vulnerability Path: Setup: IO. Trigger: Guest sends CMD to invalid LUN. Mechanism: target_submit_prep -> transport_lookup_cmd_lun fails. Returns error. target_submit_prep cleans up se_cmd via target_put_sess_cmd -> release_cmd -> vhost_scsi_release_cmd. Resources freed. Safe.",
+  "classification": "DoS",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0007",
+  "title": "vhost_scsi_calc_sgls Integer Overflow Check",
+  "concept": "Integer Overflow",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: Large IO. Trigger: Guest provides huge SGL. Mechanism: vhost_scsi_calc_sgls checks sgl_count against max_sgls. Safe.",
+  "classification": "integer-overflow",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0008",
+  "title": "vhost_scsi_map_to_sgl Infinite Loop",
+  "concept": "DoS",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: IO. Trigger: iov_iter_get_pages2 returns 0 or small value. Mechanism: Loop condition is 'while (bytes)'. bytes decrements. Safe.",
+  "classification": "DoS",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0009",
+  "title": "Double Free in vhost_scsi_release_cmd_res",
+  "concept": "Double Free",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: Error path. Trigger: release called twice. Mechanism: vhost_scsi_release_cmd_res frees pages. Does not zero pointers? Checks if page valid? Uses for_each_sgtable_sg. If called twice, might double free. However, completion logic ensures it is called once per command life cycle.",
+  "classification": "double-free",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0010",
+  "title": "vhost_scsi_tmf Use After Free",
+  "concept": "UAF",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: TMF. Trigger: TMF completion. Mechanism: vhost_scsi_release_tmf_res frees tmf. Is tmf accessed afterwards? No. tmf is container of work item.",
+  "classification": "UAF",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0011",
+  "title": "Event Injection Buffer Overflow",
+  "concept": "Buffer Overflow",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: Events. Trigger: Too many events. Mechanism: vhost_scsi_allocate_evt limits number of events. Safe.",
+  "classification": "buffer-overflow",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0012",
+  "title": "vhost_scsi_mapal chaining error",
+  "concept": "Logic Error",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: Chained SGLs. Trigger: Allocation failure in chain. Mechanism: sg_alloc_table_chained handles failure. vhost_scsi_mapal checks return. Safe.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0013",
+  "title": "Information Leak in vhost_scsi_send_status",
+  "concept": "Info Leak",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: Status. Trigger: Send status. Mechanism: memset(&rsp, 0, ...) used. Padding is zeroed. copy_to_iter used. Safe.",
+  "classification": "info-leak",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0014",
+  "title": "vhost_scsi_make_nexus String Termination",
+  "concept": "Buffer Overflow",
+  "attacker_model": "privileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: Configfs write. Trigger: vhost_scsi_tpg_nexus_store. Mechanism: snprintf limit used. Safe.",
+  "classification": "buffer-overflow",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0015",
+  "title": "vhost_scsi_destroy_vq_cmds NULL Dereference",
+  "concept": "NULL Dereference",
+  "attacker_model": "privileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: Cleanup. Trigger: destroy_vq_cmds. Mechanism: Checks svq->scsi_cmds before access. Safe.",
+  "classification": "hardening",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0016",
+  "title": "vhost_scsi_set_endpoint Memory Allocation Failure",
+  "concept": "DoS",
+  "attacker_model": "privileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: set_endpoint. Trigger: kzalloc fail. Mechanism: Returns -ENOMEM. Safe.",
+  "classification": "DoS",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0017",
+  "title": "vhost_scsi_get_cmd Tag Exhaustion",
+  "concept": "DoS",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: Heavy IO. Trigger: Exhaust tags. Mechanism: sbitmap_get returns < 0. Returns -ENOMEM. Handler sends TASK_SET_FULL. Correct behavior.",
+  "classification": "DoS",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0018",
+  "title": "vhost_scsi_chk_size Integer Overflow",
+  "concept": "Integer Overflow",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: Size check. Trigger: Check bounds. Mechanism: Checks < . Safe.",
+  "classification": "integer-overflow",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0019",
+  "title": "vhost_scsi_evt_work Concurrency",
+  "concept": "Race Condition",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: Events. Trigger: Work queue execution. Mechanism: vhost_scsi_complete_events takes vq->mutex. Safe.",
+  "classification": "race-condition",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
+{
+  "file": "drivers/vhost/scsi.c",
+  "scenario_id": "drivers/vhost/scsi.c-0020",
+  "title": "vhost_scsi_ctl_handle_vq TMF Logic",
+  "concept": "Logic Error",
+  "attacker_model": "local_unprivileged",
+  "preconditions": [],
+  "description": "Vulnerability Path: Setup: Control Queue. Trigger: TMF request. Mechanism: vhost_scsi_handle_tmf validates LUN and submits TMR. Safe.",
+  "classification": "logic-bypass",
+  "impact": "none",
+  "likelihood": "low",
+  "verdict": "not_feasible",
+  "context": "driver",
+  "evidence": [],
+  "derived_from": [],
+  "proposed_fix_summary": "None"
+}
