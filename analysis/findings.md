@@ -1,128 +1,123 @@
-### drivers/vhost/net.c — drivers/vhost/net.c-0001: TX Queue Stall via Descriptor Leak in get_tx_bufs Error Path
+### drivers/vhost/scsi.c — drivers/vhost/scsi.c-0001: Guest I/O Stall via Weight Limit in vhost_scsi_handle_vq
 
 **What is the attack?**
-- **Concept**: A malicious guest can trigger a persistent Denial of Service (DoS) of the virtio-net transmit queue by sending a specific malformed descriptor (writable descriptor in the TX queue).
+- **Concept**: A malicious or heavy-workload guest can induce a Denial of Service (stall) on the virtual SCSI device by filling the virtqueue with more requests than the configured batch weight (256).
 - **Vulnerability Path**:
-    - **Setup**: Standard vhost-net device.
-    - **Trigger**: The guest places a descriptor with the `VRING_DESC_F_WRITE` flag set into the TX virtqueue and kicks the host.
-    - **Mechanism**:
-        - The vhost worker thread executes `handle_tx_copy`.
-        - It calls `get_tx_bufs` to fetch the next descriptor.
-        - `get_tx_bufs` calls `vhost_net_tx_get_vq_desc` -> `vhost_get_vq_desc_n`.
-        - `vhost_get_vq_desc_n` successfully validates the descriptor structure, increments `vq->last_avail_idx` (marking the descriptor as consumed from the available ring), and returns the head index.
-        - `get_tx_bufs` checks the `*in` parameter (number of input/writable descriptors). Since the guest set `VRING_DESC_F_WRITE`, `*in` is non-zero.
-        - The code considers this an error for a TX queue. It logs an error via `vq_err` and returns `-EFAULT`.
-        - `handle_tx_copy` receives `-EFAULT`, breaks its processing loop, and returns.
-        - **Crucial Logic Error**: The code **fails to call** `vhost_discard_vq_desc` to roll back the `last_avail_idx`. It also **fails to call** `vhost_add_used` to return the descriptor to the guest with an error status.
-    - **Result**: The descriptor is logically "consumed" by the host but never "completed" to the guest. The guest sees the descriptor as still pending. If the guest waits for this descriptor (or if the ring fills up with such descriptors), the queue effectively stalls permanently.
+    - **Setup**: Guest configures `vhost-scsi` device.
+    - **Trigger**: Guest submits > 256 requests to the virtqueue and kicks the host.
+    - **Mechanism**: `vhost_scsi_handle_vq` runs in the vhost worker thread. It processes requests in a loop. The loop condition checks `vhost_exceeds_weight(vq, ++c, 0)`. When `c` reaches 256, this function returns `true`, causing the loop to terminate. The function then releases `vq->mutex` and returns. Crucially, it does **not** check if the ring still has pending descriptors, nor does it call `vhost_poll_queue` to reschedule the work item.
+    - **Result**: The vhost worker thread goes to sleep because it thinks work is done. The guest sees requests as pending and waits for completion. If the ring is full, the guest cannot submit new requests (and thus cannot kick again). The system deadlocks/stalls.
 
 **What can an attacker do?**
-- Permanently stall the transmit queue of the vhost-net device from within the guest (Guest-to-Guest DoS or Guest-to-Host resource waste if polling).
+- Trigger a persistent stall of the SCSI device, effectively causing a Denial of Service for the guest's storage subsystem.
 
 **What’s the impact?**
-- **Classification**: Persistent Denial of Service (DoS).
-- **Likelihood**: High. Trivial for a modified driver/guest to trigger.
-- **Context**: Driver (vhost-net).
+- **Classification**: Denial of Service (DoS).
+- **Likelihood**: Medium. Requires guest to fill the ring, which is common behavior under load.
+- **Context**: Virtualization driver.
 
 **Which code files need manual audit to confirm this?**
-- `drivers/vhost/net.c`: `get_tx_bufs` and `handle_tx_copy`.
-- `drivers/vhost/vhost.c`: `vhost_get_vq_desc_n` (to confirm side effects on `last_avail_idx`).
+- `drivers/vhost/scsi.c`: `vhost_scsi_handle_vq` function.
+- `drivers/vhost/vhost.c`: `vhost_exceeds_weight` and `vhost_poll_queue` usage patterns.
 
 **Where is the vulnerable code snippet?**
 ```c
-// drivers/vhost/net.c:1083
-    if (*in) {
-        vq_err(vq, "Unexpected descriptor format for TX: out %d, int %d\n",
-            *out, *in);
-        return -EFAULT; // Returns error WITHOUT calling vhost_discard_vq_desc()
-    }
+// drivers/vhost/scsi.c:1342
+    } while (likely(!vhost_exceeds_weight(vq, ++c, 0)));
+out:
+    mutex_unlock(&vq->mutex);
+}
+// Missing: check for more work and reschedule if needed.
 ```
 
 **What’s the fix (high-level)?**
-- In `get_tx_bufs`, if the `*in` check fails (or the subsequent `init_iov_iter` check fails), call `vhost_discard_vq_desc(vq, 1, *ndesc)` before returning `-EFAULT`. This effectively "puts back" the descriptor so it can be retried or handled correctly, or at least ensures internal state consistency (though ideally we should probably consume it and mark it used with error to prevent infinite loops, but discarding is the standard rollback mechanism in vhost). Alternatively, consume it and add to used ring with 0 length to signal completion.
+- Modify `vhost_scsi_handle_vq` to check if there are more available descriptors in the vring after the loop terminates due to weight limits.
+- If pending work exists, call `vhost_poll_queue(&vq->poll)` to ensure the worker thread is rescheduled to continue processing.
 
 ---
 
-### drivers/vhost/net.c — drivers/vhost/net.c-0002: Zerocopy Descriptor Stall via Protocol Switch
+### drivers/vhost/scsi.c — drivers/vhost/scsi.c-0002: Host Memory Exhaustion via Integer Underflow in exp_data_len
 
 **What is the attack?**
-- **Concept**: A state machine violation allows an attacker (local user owning the device) to switch the transmission mode from zerocopy to copy mode while buffers are in flight, causing the completion signals for those buffers to be lost.
+- **Concept**: An integer underflow in the calculation of `exp_data_len` allows an attacker to bypass size checks and pass a huge `data_length` to the target core, leading to massive memory allocation attempts.
 - **Vulnerability Path**:
-    - **Setup**: `experimental_zcopytx=1` is enabled. User owns the vhost-net file descriptor and the backend socket.
-    - **Trigger**:
-        1. User enables `SOCK_ZEROCOPY` on the socket.
-        2. User sends traffic, causing `vhost-net` to enter `handle_tx_zerocopy` and submit buffers with `ubuf_info`. `nvq->upend_idx` advances.
-        3. While buffers are in flight (DMA pending), user disables `SOCK_ZEROCOPY` on the socket.
-        4. User kicks the device.
+    - **Setup**: `VIRTIO_SCSI_F_T10_PI` feature negotiated.
+    - **Trigger**: Guest sends a request where `pi_bytesout` (protection info size) is slightly larger than the calculated `exp_data_len` (total data size derived from iov).
     - **Mechanism**:
-        - `handle_tx` runs. It checks `vhost_sock_zcopy(sock)`, which now returns false.
-        - It calls `handle_tx_copy` instead of `handle_tx_zerocopy`.
-        - `handle_tx_copy` processes new packets using data copying.
-        - **Crucial Omission**: `handle_tx_zerocopy` is the only function that calls `vhost_zerocopy_signal_used` to check for completed zerocopy buffers (`ubufs`) and signal them to the guest. `handle_tx_copy` does NOT call this.
-        - The backend kernel network stack completes the DMA and calls the `vhost_zerocopy_complete` callback, decrementing the `ubuf` refcount.
-        - However, the vhost-net driver logic that moves descriptors from "pending" (`upend_idx`) to "used" (`done_idx`) never runs.
-    - **Result**: The guest never receives completion interrupts for the in-flight zerocopy descriptors. They remain pending forever.
+        - `exp_data_len` is `u32`. `prot_bytes` is `int`.
+        - The code performs `exp_data_len -= prot_bytes;`.
+        - If `prot_bytes > exp_data_len`, `exp_data_len` wraps around to a large positive integer (underflow).
+        - `vhost_scsi_mapal` is called with this huge length. It processes `prot_iter` (valid) and `data_iter` (which gets exhausted because `iov_iter_advance` moves it past the end).
+        - `vhost_scsi_target_queue_cmd` calls `target_submit_prep`.
+        - `target_submit` calls `transport_generic_new_cmd`.
+        - `transport_generic_new_cmd` sees `cmd->data_length` is huge and `SCF_PASSTHROUGH_SG_TO_MEM_NOALLOC` is NOT set (because `data_sgl_count` was 0).
+        - It calls `target_alloc_sgl` with the huge length, attempting to allocate gigabytes of memory.
+    - **Result**: Immediate memory pressure on the host, potentially triggering OOM killer or denial of service.
 
 **What can an attacker do?**
-- Stall the virtqueue by creating a "black hole" for a set of descriptors.
-
-**What’s the impact?**
-- **Classification**: Denial of Service (DoS) / Logic Bypass.
-- **Likelihood**: Medium. Requires `experimental_zcopytx` and specific socket manipulation.
-- **Context**: Driver.
-
-**Which code files need manual audit to confirm this?**
-- `drivers/vhost/net.c`: `handle_tx`, `handle_tx_copy`, `handle_tx_zerocopy`.
-
-**Where is the vulnerable code snippet?**
-```c
-// drivers/vhost/net.c:1278
-    if (vhost_sock_zcopy(sock))
-        handle_tx_zerocopy(net, sock); // Handles signaling
-    else
-        handle_tx_copy(net, sock);     // Does NOT handle signaling
-```
-
-**What’s the fix (high-level)?**
-- Modify `handle_tx` or `handle_tx_copy` to ensure that `vhost_zerocopy_signal_used` is called if there are pending zerocopy buffers (`nvq->upend_idx != nvq->done_idx`), even if the current mode is copy-based.
-
----
-
-### drivers/vhost/net.c — drivers/vhost/net.c-0003: Host Process Hang via Zerocopy Reference Pinning
-
-**What is the attack?**
-- **Concept**: Resource exhaustion and process hang caused by the unprivileged user's ability to pin kernel memory indefinitely via the zerocopy mechanism.
-- **Vulnerability Path**:
-    - **Setup**: `experimental_zcopytx=1`.
-    - **Trigger**:
-        1. User creates a vhost-net instance attached to a TAP device.
-        2. User sends zerocopy packets. These become SKBs in the TAP receive queue, holding a reference to `ubufs`.
-        3. User does *not* read from the TAP device.
-        4. User calls `close()` on the vhost-net file descriptor.
-    - **Mechanism**:
-        - `vhost_net_release` calls `vhost_net_flush`.
-        - `vhost_net_flush` calls `vhost_net_ubuf_put_and_wait`.
-        - This function waits specifically for `atomic_read(&ubufs->refcount) == 0`.
-        - Since the SKBs are still alive in the TAP queue, the refcount remains > 0.
-        - The `close()` call (and the userspace process) enters an uninterruptible sleep (D-state) waiting for the refcount.
-    - **Result**: The process cannot be killed. Kernel memory associated with the process and the vhost device remains allocated.
-
-**What can an attacker do?**
-- Cause processes to hang indefinitely in D-state, potentially exhausting system resources (PID limit, memory) if repeated.
+- Exhaust host kernel memory (DoS) or trigger OOM kills of other processes.
 
 **What’s the impact?**
 - **Classification**: Resource Exhaustion / DoS.
-- **Likelihood**: Medium. Known issue type for zerocopy, but impactful.
-- **Context**: Driver.
+- **Likelihood**: Medium. Specific feature (T10_PI) must be enabled.
+- **Context**: Virtualization driver.
 
 **Which code files need manual audit to confirm this?**
-- `drivers/vhost/net.c`: `vhost_net_release`, `vhost_net_flush`.
+- `drivers/vhost/scsi.c`: `vhost_scsi_handle_vq` logic for `exp_data_len` and `prot_bytes`.
+- `drivers/target/target_core_transport.c`: `transport_generic_new_cmd` allocation logic.
 
 **Where is the vulnerable code snippet?**
 ```c
-// drivers/vhost/net.c:1347
-    vhost_net_ubuf_put_and_wait(n->vqs[VHOST_NET_VQ_TX].ubufs);
+// drivers/vhost/scsi.c:1229
+if (prot_bytes) {
+    exp_data_len -= prot_bytes; // UNDERFLOW
+    prot_iter = data_iter;
+    iov_iter_truncate(&prot_iter, prot_bytes);
+    iov_iter_advance(&data_iter, prot_bytes);
+}
 ```
 
 **What’s the fix (high-level)?**
-- This is an inherent risk of zerocopy. Hardening could involve a timeout in `vhost_net_flush` (followed by a leak warning instead of a hang), or mechanisms to force-purge the backend queues (though difficult across subsystems). Documenting the risk or restricting `experimental_zcopytx` to privileged users is the mitigation.
+- Add a sanity check before subtraction: `if (prot_bytes > exp_data_len) goto err;`.
+
+---
+
+### drivers/vhost/scsi.c — drivers/vhost/scsi.c-0003: Resource Leak in vhost_scsi_target_queue_cmd on Initialization Failure
+
+**What is the attack?**
+- **Concept**: Failure to release resources when `target_init_cmd` fails leads to a leak of `vhost_scsi_cmd` structures, tags, and inflight references.
+- **Vulnerability Path**:
+    - **Setup**: Standard operation.
+    - **Trigger**: A condition causing `target_init_cmd` to fail (e.g., `target_get_sess_cmd` fails due to session shutdown or refcount issues).
+    - **Mechanism**:
+        - `vhost_scsi_get_cmd` allocates a tag and increments `inflight` refcount.
+        - `vhost_scsi_target_queue_cmd` calls `target_init_cmd`.
+        - If `target_init_cmd` fails, it returns error code.
+        - `vhost_scsi_target_queue_cmd` checks the error: `if (rc) return;`.
+        - It returns `void`, so the caller (`vhost_scsi_handle_vq`) assumes success (as previous steps were successful).
+        - The `cmd` is orphaned. The tag remains "busy" in the bitmap. The `inflight` refcount is never decremented.
+    - **Result**: Repeated triggering leads to exhaustion of command tags (DoS) or inability to flush/close the device (due to stuck inflight refcount).
+
+**What can an attacker do?**
+- Permanently deplete the available command tags, preventing any further I/O (DoS).
+
+**What’s the impact?**
+- **Classification**: Resource Leak / DoS.
+- **Likelihood**: Low (requires specific failure mode in target core).
+- **Context**: Driver.
+
+**Which code files need manual audit to confirm this?**
+- `drivers/vhost/scsi.c`: `vhost_scsi_target_queue_cmd`.
+
+**Where is the vulnerable code snippet?**
+```c
+// drivers/vhost/scsi.c:1049
+    rc = target_init_cmd(se_cmd, nexus->tvn_se_sess, &cmd->tvc_sense_buf[0],
+            lun, exp_data_len, vhost_scsi_to_tcm_attr(task_attr),
+            data_dir, TARGET_SCF_ACK_KREF);
+    if (rc)
+        return; // LEAK: cmd resources not freed
+```
+
+**What’s the fix (high-level)?**
+- In `vhost_scsi_target_queue_cmd`, if `target_init_cmd` fails, call `vhost_scsi_release_cmd_res(se_cmd)` before returning.
