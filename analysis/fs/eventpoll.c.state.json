@@ -1,0 +1,11 @@
+{
+  "file": "fs/eventpoll.c",
+  "total_scenarios": 40,
+  "confirmed_vulns": 0,
+  "last_scenario_id": "fs/eventpoll.c-0040",
+  "high_level_findings": [
+    "Loop detection and refcount/lifetime handling across nested epolls rely on RCU snapshots and can race with concurrent epoll_ctl, risking recursion and stale pointers",
+    "Wakeup source management and poll callback teardown lack synchronization, leaving opportunities for UAF and info leaks when EPOLLWAKEUP is toggled or deleted",
+    "Busy-poll and resource accounting paths (max_user_watches, busy_poll_budget, wakeup_source creation) allow unprivileged users to exhaust CPU or memory without strong quotas"
+  ]
+}

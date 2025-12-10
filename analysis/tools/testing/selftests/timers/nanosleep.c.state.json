@@ -1,0 +1,11 @@
+{
+  "file": "tools/testing/selftests/timers/nanosleep.c",
+  "total_scenarios": 10,
+  "confirmed_vulns": 0,
+  "last_scenario_id": "tools/testing/selftests/timers/nanosleep.c-0010",
+  "high_level_findings": [
+    "SIGALRM handler and timer teardown leave global process state exposed to races and cross-test interference",
+    "Clock manipulation (slew/step) can cause false positives or negatives because timing checks reuse the tested clock",
+    "Error paths and unbounded inputs lack guards, risking misleading passes or CPU exhaustion under adversarial conditions"
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "file": "net/ipv4/tcp_input.c",
+  "total_scenarios": 40,
+  "confirmed_vulns": 0,
+  "last_scenario_id": "net/ipv4/tcp_input.c-0040",
+  "high_level_findings": [
+    "Fast-path timestamp and header prediction logic accepts state changes before full validation, exposing PAWS, ECN, and RTT manipulation risks.",
+    "Receive window growth and sndbuf expansion rely on unbounded driver/module inputs, enabling memory inflation or policy bypass.",
+    "BPF sock_ops invocation under socket lock and busy-poll contexts can deadlock or bypass ownership checks, warranting rate limiting and synchronization.",
+    "Discard and fragstolen paths free skbs/frags without coordinating with shared references, risking UAF/double-free under offload and GRO scenarios."
+  ]
+}

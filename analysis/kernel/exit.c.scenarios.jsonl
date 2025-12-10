@@ -1,0 +1,600 @@
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0001",
+  "title": "Delayed io_uring_files_cancel race with freed mm during exit",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_IO_URING", "attacker can submit async requests"],
+  "description": "Force heavy io_uring submissions then trigger exit while another thread unmaps the mm; io_uring_files_cancel() is invoked early in do_exit before exit_mm, so request callbacks may dereference the disappearing mm or task work if cancellation is delayed.",
+  "classification": "race-condition",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:907-914: do_exit() calls io_uring_files_cancel() prior to exit_signals and exit_mm teardown"],
+  "proposed_fix_summary": "Flush or serialize io_uring cancellations after mm teardown or hold references while cancelling."
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0002",
+  "title": "Ptrace exit event floods tracer bypassing rate limits",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_PTRACE", "attacker controls traced task"],
+  "description": "Spawn many short-lived tasks under a permissive tracer; ptrace_event(PTRACE_EVENT_EXIT) fires for each exit with minimal throttling, allowing attacker to starve tracer or kernel notification queues and leak timing information about exit ordering.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:907-910: exit path unconditionally triggers ptrace_event for exits"],
+  "proposed_fix_summary": "Add ptrace exit rate limiting or enforce tracer cgroup quotas for massive fork/exit storms."
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0003",
+  "title": "Seccomp filter release after PF_EXITING leaves hooks live",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_SECCOMP"],
+  "description": "Task sets seccomp listeners then exits; seccomp_filter_release() occurs after exit_signals sets PF_EXITING but before task_work exit. If listener holds task references, callbacks could run on partially torn-down task leaking state or refcounts.",
+  "classification": "race-condition",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:913-916: exit_signals then seccomp_filter_release without additional synchronization"],
+  "proposed_fix_summary": "Guard seccomp listener callbacks against PF_EXITING tasks and drain task_work prior to release." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0004",
+  "title": "Group exit code overwrite by last exiting thread",
+  "attacker_model": "container_guest",
+  "preconditions": ["shared PID namespace", "multi-threaded service"],
+  "description": "In a shared container, attacker spawns threads and triggers fatal signal; synchronize_group_exit sets group_exit_code when quick_threads hits zero. A later attacker-controlled thread may still run and overwrite exit_code before parent reaps, confusing supervisor policy.",
+  "classification": "logic-bypass",
+  "impact": "boundary bypass",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:867-881: group_exit_code assigned when quick_threads reaches zero without locking against late writers"],
+  "proposed_fix_summary": "Make exit_code updates atomic once SIGNAL_GROUP_EXIT set or require tasklist lock around group_exit_code changes." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0005",
+  "title": "Core dump thread list traversal after sibling frees signal struct",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["setuid helper triggers coredump", "multiple threads exiting"],
+  "description": "During coredump_task_exit(), attacker forces sibling to exit and free signal_struct while core_state walk runs with only siglock-based assumptions; concurrent exit could detach from thread list, leading to stale pointer dereference during dumper synchronization.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:424-447: coredump_task_exit loops scheduling while core_state->nr_threads decremented and relies on core_state list"],
+  "proposed_fix_summary": "Hold reference on signal/core_state across coredump_task_exit or block sibling exit until dump complete." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0006",
+  "title": "mm owner reassignment races with exec by sibling",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_MEMCG", "thread group exec allowed"],
+  "description": "Attacker triggers exit_mm while sibling execs; mm_update_next_owner searches children/siblings under tasklist_lock but mm->owner cleared only if mm_users<=1. Rapid exec may swap mm while owner reassignment races, leaving owner NULL and cgroup charging inconsistent, enabling resource accounting bypass.",
+  "classification": "race-condition",
+  "impact": "resource bypass",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:487-520: mm_update_next_owner iterates task list while mm_users checked earlier"],
+  "proposed_fix_summary": "Re-evaluate mm_users under lock and pin mm during owner search to avoid NULL owner gaps." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0007",
+  "title": "panic on init exit reachable by controlled group_exit_code",
+  "attacker_model": "privileged",
+  "preconditions": ["attacker controls init or can inject fatal signal"],
+  "description": "Malicious init triggers fatal signal with crafted group_exit_code causing panic in do_exit when group_dead && is_global_init. Container runtimes relying on host kernel panic avoidance may be destabilized leading to forced reboot.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:921-926: do_exit panics if global init exits with group_dead"],
+  "proposed_fix_summary": "Restrict panic-on-init-exit to configurable sysctl or require CAP_SYS_BOOT to trigger." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0008",
+  "title": "Real-time timer cancellation missing check for reused signal struct",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_POSIX_TIMERS", "attacker can rapidly fork/exit"],
+  "description": "Thread exits while another thread immediately reuses signal_struct via fork sharing; hrtimer_cancel and exit_itimers in do_exit act on signal without verifying it's still owned, risking use-after-free if refcounted outside." ,
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:928-932: hrtimer_cancel and exit_itimers executed on signal when group_dead without extra ref"],
+  "proposed_fix_summary": "Hold reference to signal_struct while cancelling timers or guard with atomic ownership flag." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0009",
+  "title": "acct_process under group_dead exposed to uncharged io_context",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["task can issue I/O then exit group"],
+  "description": "Attacker dirties buffers and exits last thread, causing acct_process to run with stale io_context if exit_io_context later fails, leading to accounting underflow or freed io_context observed by accounting readers.",
+  "classification": "race-condition",
+  "impact": "data corruption",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:961-999: acct_process runs before exit_io_context and splice pipe cleanup"],
+  "proposed_fix_summary": "Ensure io_context lifetime pinned until accounting complete or reorder cleanup." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0010",
+  "title": "exit_task_work ordering allows task_work to access freed files",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["task_work_add hooks active"],
+  "description": "Attacker queues task_work referencing struct files; do_exit calls exit_files before exit_task_work. If task_work executed late via task_work_run in notify paths, it may dereference freed files, causing UAF.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:964-971: exit_files occurs before exit_task_work during teardown"],
+  "proposed_fix_summary": "Drain task_work before closing files or cancel queued items referencing files." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0011",
+  "title": "exit_nsproxy_namespaces frees ns while perf_event still active",
+  "attacker_model": "container_guest",
+  "preconditions": ["unprivileged perf_event_open in namespace"],
+  "description": "Attacker attaches perf events to namespace resources then triggers exit; exit_nsproxy_namespaces runs before perf_event_exit_task, so perf callbacks may use freed nsproxy fields leading to leak or crash.",
+  "classification": "race-condition",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:966-975: exit_nsproxy_namespaces precedes perf_event_exit_task in do_exit order"],
+  "proposed_fix_summary": "Reorder teardown so perf_event_exit_task precedes namespace drop or pin ns in perf context." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0012",
+  "title": "Cgroup exit charges lost when exiting with pending task_work",
+  "attacker_model": "container_guest",
+  "preconditions": ["CONFIG_CGROUPS", "task_work used for offload"],
+  "description": "Attacker schedules task_work that moves cgroup membership then exits; cgroup_task_exit runs before exit_task_work, so updates may be lost causing dangling css references and resource bypass across cgroups.",
+  "classification": "logic-bypass",
+  "impact": "resource bypass",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:974-975 then 970-971 ordering shows cgroup_task_exit precedes exit_task_work"],
+  "proposed_fix_summary": "Run task_work before final cgroup exit or block membership changes once PF_EXITING set." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0013",
+  "title": "splice pipe free after task_frag page reuse",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["task uses splice", "shared pipe"] ,
+  "description": "Attacker triggers exit while holding splice_pipe and task_frag.page references; free_pipe_info and put_page occur late without locking, so concurrent pipe activity may see freed page leading to UAF.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:995-1003: free_pipe_info and put_page executed after exit_io_context with no serialization"],
+  "proposed_fix_summary": "Ensure pipe references drained before exit path or add refcount checks before freeing task_frag page." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0014",
+  "title": "Delayed lockdep_free_task on reused task struct",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_LOCKDEP", "task reuse via pidfd/tid reuse race"],
+  "description": "A killed task’s struct task_struct may be examined by lockdep before lockdep_free_task at end of do_exit; pidfd reuse could expose stale lock state to observer, enabling false positives or missing lock misuse detection aiding exploit timing.",
+  "classification": "hardening",
+  "impact": "boundary bypass",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:1011-1014: lockdep_free_task runs just before do_task_dead"],
+  "proposed_fix_summary": "Zero lockdep state earlier or disallow pidfd observation until after lockdep cleanup." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0015",
+  "title": "exit_fs races with in-flight file descriptor install",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["multi-threaded process manipulating fs_struct"],
+  "description": "One thread exits and calls exit_fs while another installs file descriptors or changes root/pwd; lacking strong synchronization beyond refcounts, fs_struct may be freed while still referenced, causing UAF when other thread runs.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:964-968: exit_files then exit_fs without ensuring other threads stopped unless group_dead"],
+  "proposed_fix_summary": "Require group_dead before fs teardown or grab global references before freeing." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0016",
+  "title": "exit_signals sets PF_EXITING too late for shared sighand mutation",
+  "attacker_model": "container_guest",
+  "preconditions": ["shared signal handler threads", "attacker controls sibling"],
+  "description": "A sibling thread modifies shared signal handler (sigaction) after exit_signals sets PF_EXITING but before current thread drops sighand; PF_EXITING may not prevent updates, leading to handler table use after free or inconsistent delivery.",
+  "classification": "race-condition",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:907-916 and 914-917: exit_signals sets PF_EXITING then seccomp release before sighand cleanup"],
+  "proposed_fix_summary": "Block signal handler mutations once PF_EXITING set or serialize with sighand lock held throughout." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0017",
+  "title": "rcuwait_wake_up on zombie with refcount underflow",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["attacker registers rcuwait target to exiting task"],
+  "description": "Attacker waits on a target task then kills it repeatedly; rcuwait_wake_up traverses rcuwait without explicit task ref increment, so exit path freeing task_struct could underflow refcount when wake attempts reuse struct.",
+  "classification": "refcount",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:314-330: rcuwait_wake_up uses rcu_read_lock but doesn't take task ref before wake"],
+  "proposed_fix_summary": "Take get_task_struct under RCU before waking or validate task_state." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0018",
+  "title": "kill_orphaned_pgrp relies on has_stopped_jobs without RCU protection",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["attacker controls process group transitions"],
+  "description": "Rapid reparenting and stopping jobs can race kill_orphaned_pgrp decision, causing signals to be sent spuriously or missed, enabling backgrounded jobs to persist in disallowed sessions or deliver unexpected SIGHUP/SIGCONT.",
+  "classification": "logic-bypass",
+  "impact": "boundary bypass",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:399-421: kill_orphaned_pgrp inspects pgrp/session without explicit locking"],
+  "proposed_fix_summary": "Protect orphan detection with RCU or tasklist lock and double-check before sending signals." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0019",
+  "title": "tty_kref_put on shared tty after group_dead yields UAF",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["shared controlling TTY", "multi-threaded process"],
+  "description": "Group leader exits last and tty_kref_put releases tty while background thread still referencing tty via file descriptor; lack of synchronization may allow operations on freed tty struct.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:217-220: tty_kref_put invoked when group_dead in __exit_signal"],
+  "proposed_fix_summary": "Hold extra tty ref for outstanding file descriptors or delay tty_kref_put until close." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0020",
+  "title": "flush_sigqueue without locks after exit_signal",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["attacker can queue realtime signals"],
+  "description": "Exit path flushes pending signals lockless after removal from task lists. A malicious thread could queue signals right before PF_EXITING and race flush_sigqueue, leading to leaked sigqueue elements or use-after-free in signal delivery.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:297-305: flush_sigqueue called lockless after tasklist removal"],
+  "proposed_fix_summary": "Gate signal queuing once PF_EXITING set or hold siglock during flush." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0021",
+  "title": "exit_notify uses tasklist_lock scope mismatch with pidfs_exit",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["pidfd userspace monitors", "rapid fork/exit"],
+  "description": "Attacker triggers exit_notify while pidfs_exit already ran; exit_notify walks parent/children under tasklist_lock but pidfs updates happened earlier without cross-check, allowing stale pidfd waiters to dereference freed pid entries.",
+  "classification": "race-condition",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:257-295 and 982-985: pidfs_exit precedes exit_notify with different locking contexts"],
+  "proposed_fix_summary": "Unify pidfs and exit_notify locking or hold references to pid structures across both stages." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0022",
+  "title": "taskstats_exit races with audit_free leading to partial record",
+  "attacker_model": "container_guest",
+  "preconditions": ["CONFIG_TASKSTATS", "CONFIG_AUDIT"],
+  "description": "Attacker switches namespaces and triggers exit; audit_free frees audit context before taskstats_exit collects data. Stats may reference freed audit buffer leading to info leak or corrupted report to parent.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:937-942: audit_free before taskstats_exit"],
+  "proposed_fix_summary": "Collect audit references before freeing or serialize statistics gathering with audit teardown." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0023",
+  "title": "PF_POSTCOREDUMP flag reuse lets attacker block exit of threads",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["coredump enabled", "multi-threaded app"] ,
+  "description": "Attacker triggers coredump then loops causing quick_threads logic to set PF_POSTCOREDUMP. Threads with this flag spin in coredump_task_exit schedule loop; attacker could starve CPU or prevent exit of other tasks indefinitely by keeping core_state alive.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:867-894: PF_POSTCOREDUMP set and threads wait in coredump_task_exit schedule loop"],
+  "proposed_fix_summary": "Add timeout or limit for coredump waiters and enforce group kill on stuck dumper." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0024",
+  "title": "exit_mm leaves pinned pages mapped in userfaultfd regions",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_USERFAULTFD", "attacker manages userfaultfd"],
+  "description": "Attacker pins pages via userfaultfd then exits while fault handler still running. exit_mm tears down mm without coordinating with userfaultfd handler leading to stale ptes pinned and potential reuse for cross-process mapping leaks.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:959: exit_mm called without explicit userfaultfd coordination"],
+  "proposed_fix_summary": "Notify userfaultfd handlers before exit_mm or revoke pinned pages when PF_EXITING set." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0025",
+  "title": "exit_shm reorder with exit_files leaks shm_file refs",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_SYSVIPC", "shared memory segments in use"],
+  "description": "exit_shm executes after exit_sem but before exit_files; if shm VMAs hold file references, tearing down without closing files may leak or double-drop shm_file references when mm teardown later frees them.",
+  "classification": "refcount",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:964-966: exit_sem then exit_shm before exit_files"],
+  "proposed_fix_summary": "Align shm cleanup with file teardown or hold dedicated ref during exit." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0026",
+  "title": "io_context exit after accounting can corrupt blkcg stats",
+  "attacker_model": "container_guest",
+  "preconditions": ["CONFIG_BLK_CGROUP", "task uses ioc"],
+  "description": "acct_process uses execution time before exit_io_context frees I/O context. If blkcg accounting tries to charge post exit, freed ioc may be reused leading to cross-cgroup accounting leak.",
+  "classification": "refcount",
+  "impact": "data corruption",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:961-999: acct_process and exit_io_context ordering"],
+  "proposed_fix_summary": "Pin io_context until accounting complete or perform blkcg charges before freeing." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0027",
+  "title": "panic from oops_limit reachable by unprivileged fault storms",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_PANIC_ON_OOPS unset", "oops_limit default 10000"],
+  "description": "Attacker triggers repeated kernel oopses via bugging subsystem; make_task_dead increments oops_count and panics when oops_limit exceeded, enabling local denial of service reboot without CAP_SYS_BOOT.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:1058-1061: panic when oops_count exceeds oops_limit"],
+  "proposed_fix_summary": "Require capability to raise oops_count threshold or make panic on oops configurable per cgroup." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0028",
+  "title": "recursive fault recovery leaves PF_EXITING task reachable",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["fault triggers while exiting"],
+  "description": "make_task_dead handles recursive fault by setting EXIT_DEAD and calling do_task_dead without full cleanup. Attackers can induce repeated faults leaving partially torn-down task with elevated refcount rcusers increment, potentially leaking task_struct memory accessible via pidfd.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:1066-1072: recursive fault path increments rcu_users and skips normal exit"],
+  "proposed_fix_summary": "Ensure recursive faults fully isolate task from user observation and scrub task_struct contents." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0029",
+  "title": "exit_sem ordering with futex_exit_recursive deadlocks",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_FUTEX", "attacker holds pi futex"],
+  "description": "Attacker triggers fatal fault while holding pi futex; make_task_dead calls futex_exit_recursive only in recursive fault path, but normal exit_sem runs earlier. Stuck futex owners may deadlock other tasks, enabling DoS or priority inversion.",
+  "classification": "race-condition",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:964-987 and 1066-1069: futex cleanup differs between paths"],
+  "proposed_fix_summary": "Ensure futex_exit_recursive or equivalent runs on normal exit when PI futex held or detect stuck owners." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0030",
+  "title": "dirty_throttle_leaks counter overflow via exit storm",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_BALANCE_ANON_FILE_RECLAIM"] ,
+  "description": "Massive dirty write bursts then rapid exit increment per-cpu dirty_throttle_leaks in do_exit. Lack of bounds may overflow and skew throttling heuristics, letting attacker bypass write throttling intermittently.",
+  "classification": "resource-bypass",
+  "impact": "data corruption",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:1006-1010: adds nr_dirtied to dirty_throttle_leaks without saturation"] ,
+  "proposed_fix_summary": "Clamp dirty_throttle_leaks and validate before use; limit increments per exit." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0031",
+  "title": "exit_tasks_rcu_start with pending RCU callbacks leaks objects",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["attacker queues RCU callbacks referencing task"],
+  "description": "Attacker triggers task_work that schedules RCU callbacks then exits; exit_tasks_rcu_start may run before callbacks flush, leaving callbacks referencing freed task data and leading to delayed UAF when grace period ends.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:982-1012: exit_tasks_rcu_start/finish bracket exit without explicit flushing of queued callbacks"],
+  "proposed_fix_summary": "Drain task-related RCU callbacks before exit_tasks_rcu_start or hold references." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0032",
+  "title": "do_task_dead reachable with preempt enabled in critical section",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["preemption enabled", "attacker can trigger oops in critical section"],
+  "description": "make_task_dead attempts to fix preempt_count but may leave locks held; do_task_dead runs scheduler with inconsistent state letting attacker hold spinlock indefinitely and starve CPUs.",
+  "classification": "race-condition",
+  "impact": "persistent DoS",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:1019-1074: make_task_dead manipulates preempt_count and jumps to do_exit/do_task_dead"],
+  "proposed_fix_summary": "Add lockdep checks and force unlock of held spinlocks before do_task_dead." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0033",
+  "title": "exit_notify forgets to wake pidfd waiters on group_dead false",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["pidfd_open used", "thread exits but group remains"],
+  "description": "Thread exit when group_dead false calls exit_notify which may not wake pidfd waiters waiting for specific thread PID, leading to hung pidfd_poll and allowing attacker to block supervisors.",
+  "classification": "logic-bypass",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:982-985: exit_notify invoked after exit_tasks_rcu_start without explicit pidfd wake when not group_dead"],
+  "proposed_fix_summary": "Ensure pidfd waiters woken for individual thread exits regardless of group_dead status." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0034",
+  "title": "per-task randomness update on exit can leak runtime",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_RANDOM"],
+  "description": "add_device_randomness mixes sum_exec_runtime into global pool on exit. Attacker can measure RNG output differences via repeated exits to infer scheduler runtime of victims sharing CPU, a side channel for profiling.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:292-295: add_device_randomness with se.sum_exec_runtime"],
+  "proposed_fix_summary": "Avoid mixing predictable runtime data or hash with secret salt before mixing." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0035",
+  "title": "detach_pid without pidfd fencing allows stale pid references",
+  "attacker_model": "container_guest",
+  "preconditions": ["pid namespace", "pidfd usage"],
+  "description": "__unhash_process detaches pid structures and wakes pidfd waiters. If attacker holds pidfd, they may race detach_pid and access proc entries before proc_flush_pid, exposing transient pid reuse states for info leak.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:212-213 and 289-292: detach_pid then proc_flush_pid after unlocking tasklist"],
+  "proposed_fix_summary": "Flush pid caches before pidfd wake or delay pid reuse until proc flush complete." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0036",
+  "title": "__cleanup_sighand frees handlers with active perf event breakpoints",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_HW_BREAKPOINT", "per-thread perf events"],
+  "description": "Attacker exits thread with attached breakpoints while sibling threads still using shared sighand. __cleanup_sighand frees sighand under siglock, but perf_event hw breakpoints might still reference handlers leading to UAF.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:214-218: __cleanup_sighand called after sighand->siglock release scope"] ,
+  "proposed_fix_summary": "Pin sighand until perf breakpoints detached or clear breakpoints before cleanup." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0037",
+  "title": "exit_code propagation bypass with ptrace reparenting",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["ptrace PTRACE_ATTACH allowed"],
+  "description": "Tracer reparenting can change real_parent; exit_notify uses reparented parent for signal delivery. Attacker attaches tracer to victim then forces exit to redirect exit_code to controlled parent, bypassing intended supervision.",
+  "classification": "logic-bypass",
+  "impact": "boundary bypass",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:263-288 and 982-985: exit_notify uses parent relationships updated earlier"] ,
+  "proposed_fix_summary": "Validate exit signal target against original parent policy or restrict ptrace reparenting effects." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0038",
+  "title": "exit_task_stack_account undercounts kernel stacks on forced kill",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_VMAP_STACK"],
+  "description": "Forced SIGKILL of many threads triggers exit before stack accounting updates; exit_task_stack_account may be skipped on recursive fault path leaving per-cpu counters inconsistent and enabling stack exhaustion bypass.",
+  "classification": "resource-bypass",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:1004-1007 and 1066-1072: recursive fault path may bypass normal stack accounting"],
+  "proposed_fix_summary": "Ensure stack accounting executed even during recursive faults or clamp allocation." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0039",
+  "title": "exit_files prior to disassociate_ctty leaks TTY references",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["controlling tty", "threads still referencing tty files"],
+  "description": "exit_files closes FDs before disassociate_ctty; malicious thread holding tty fd may trigger operations after file close but before ctty detach, confusing tty reference counting and enabling crash.",
+  "classification": "race-condition",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:964-969: exit_files then exit_fs then disassociate_ctty when group_dead"] ,
+  "proposed_fix_summary": "Disassociate controlling tty before closing related file descriptors or synchronize with tty core." 
+}
+{
+  "file": "kernel/exit.c",
+  "scenario_id": "kernel/exit.c-0040",
+  "title": "unwind_deferred_task_exit flush too late for kprobe handlers",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CONFIG_KPROBES"],
+  "description": "Attacker triggers kprobes with deferred unwinds then exits. unwind_deferred_task_exit flushes after perf_event_exit_task but before exit_mm; if unwinder touches mm after teardown, deferred work may access freed stack leading to crash.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["kernel/exit.c:951-959: unwind_deferred_task_exit before exit_mm"],
+  "proposed_fix_summary": "Flush deferred unwinds earlier or hold mm reference for unwinder work." 
+}

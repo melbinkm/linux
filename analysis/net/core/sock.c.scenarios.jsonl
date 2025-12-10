@@ -1,0 +1,600 @@
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0001",
+  "title": "SCM-passed privileged socket retains opener capabilities",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["CAP_NET_RAW socket opened by privileged helper", "SCM_RIGHTS transfer to unprivileged process"],
+  "description": "A privileged process opens a raw socket and passes the fd via SCM_RIGHTS into an unprivileged namespace. sk_ns_capable/sk_capable rely on the opener's file creds rather than the current task, so the unprivileged recipient can invoke operations (e.g., SO_MARK, raw send) that keep using the original capabilities, bypassing intended privilege separation.",
+  "classification": "logic-bypass",
+  "impact": "LPE",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:171-191: capability checks reference opener file and current ns", "net/core/sock.c:3016-3036: SO_MARK gate depends on capability helpers"],
+  "proposed_fix_summary": "Re-evaluate capability checks to use current task creds for per-call enforcement or forbid SCM_RIGHTS use of sockets requiring privileged operations."
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0002",
+  "title": "Userns capability confusion for network namespace override",
+  "attacker_model": "container_guest",
+  "preconditions": ["User namespace with mapped root", "Host network namespace shared", "CAP_NET_ADMIN in container"],
+  "description": "sk_net_capable verifies capability in sk->sk_socket->file user_ns and target netns, but a container with a mapped root may pass a socket created in init_user_ns to the container. Because file creds remain in init_user_ns, sk_net_capable will succeed even though the caller lacks host caps, enabling packet marking or timestamping changes across namespaces.",
+  "classification": "logic-bypass",
+  "impact": "privilege_escalation",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:171-207: capability helpers operate on opener user_ns and current task"],
+  "proposed_fix_summary": "When crossing user namespaces, require capabilities in both opener and current user_ns or forbid file descriptors to be reused across mismatched namespaces for privileged options."
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0003",
+  "title": "Emergency socket reserves left enabled after demotion",
+  "attacker_model": "privileged",
+  "preconditions": ["SOCK_MEMALLOC set on helper socket", "Later cleared while allocations remain"],
+  "description": "sk_set_memalloc enables access to emergency reserves and increments a static key, but sk_clear_memalloc only reclaims rmem when called. If helpers flip SOCK_MEMALLOC off while queued traffic still pins sk_wmem allocations, the static key may stay enabled and the socket may continue bypassing rmem limits, allowing privileged attackers to drain emergency memory despite clearing the flag.",
+  "classification": "resource-exhaustion",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:302-324: SOCK_MEMALLOC toggling and rmem reclaim"],
+  "proposed_fix_summary": "Track outstanding memalloc charges and defer static key decrement until both flag and allocations are cleared; audit callers to forbid mixed state." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0004",
+  "title": "Bypass of protocol memory limits via sysctl_bypass_prot_mem",
+  "attacker_model": "privileged",
+  "preconditions": ["sysctl net.core.bypass_prot_mem toggled", "Ability to create many sockets"],
+  "description": "sk_alloc honours net->core.sysctl_bypass_prot_mem to skip per-proto accounting. A privileged user or misconfigured sysctl can mass-create sockets with sk_bypass_prot_mem set, avoiding proto memory limits and overwhelming per-net memory, impacting other tenants without triggering pressure controls.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "high",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2310-2320: sysctl_bypass_prot_mem flips sk_bypass_prot_mem during allocation", "net/core/sock.c:3105-3174: memory pressure hooks rely on proto accounting"] ,
+  "proposed_fix_summary": "Restrict sysctl_bypass_prot_mem to CAP_SYS_ADMIN and default it off; cap total bypass sockets per net and integrate with memory pressure accounting." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0005",
+  "title": "Net namespace refcount downgrade race for kernel sockets",
+  "attacker_model": "privileged",
+  "preconditions": ["Kernel socket created in netns slated for teardown", "Concurrent netns dismantle"],
+  "description": "Kernel sockets set sk_net_refcnt=0 in sk_alloc and rely on net_passive_inc/dec plus ns_tracker. If a kernel socket is cloned or inherited while the namespace is being torn down, the passive ref may be dropped before all users release, leading to premature netns teardown and UAF of sk->ns_tracker.",
+  "classification": "race-condition",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2313-2322: kernel sockets set sk_net_refcnt=0 and use passive refs", "net/core/sock.c:2390-2397: sk_net_refcnt_upgrade manipulates tracker during teardown"] ,
+  "proposed_fix_summary": "Pin netns strongly for kernel sockets until destruction completes and synchronize netns teardown with sk_clone/sk_net_refcnt_upgrade." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0006",
+  "title": "unsafe_memcpy in sock_copy leaks uninitialized padding",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Ability to trigger sk_clone via accept/connect on protocol using sock_copy"],
+  "description": "sock_copy copies the entire sock object except sk_dontcopy region using unsafe_memcpy. If prot->obj_size exceeds initialized fields or includes padding, cloned sockets may carry uninitialized data observable through info leaks (diag, padding returned to userspace) or leak references that break refcounting.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2203-2223: sock_copy uses unsafe_memcpy on proto-sized object"] ,
+  "proposed_fix_summary": "Zero pad the destination before copy or limit copy to initialized fields; prefer struct-level helpers that avoid unsafe_memcpy for padding." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0007",
+  "title": "Module owner refcount leak on sk_prot_alloc failure path",
+  "attacker_model": "privileged",
+  "preconditions": ["Rare allocation failure with module-based proto", "Ability to spray socket creations"],
+  "description": "sk_prot_alloc increments module ref via try_module_get before returning the allocated sock. In combined failure scenarios where security_sk_alloc succeeds but later initialization fails, module_put is deferred to sk_prot_free. If callers abort before sk_prot_free, module refs may leak, preventing module unload and exhausting module refcount structures.",
+  "classification": "resource-leak",
+  "impact": "persistent DoS",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2231-2265: module_get in sk_prot_alloc and cleanup only in sk_prot_free"] ,
+  "proposed_fix_summary": "Ensure all allocation failure paths call sk_prot_free or module_put and audit callers for early abort handling." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0008",
+  "title": "Re-use of sk after async destruction via SOCK_RCU_FREE",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Protocol uses SOCK_RCU_FREE", "Concurrent sock_diag dump"],
+  "description": "sk_destruct defers freeing to call_rcu when SOCK_RCU_FREE or reuseport callbacks are present. sock_diag_has_destroy_listeners can broadcast destroy events concurrently. A racing diag walker may still dereference sk fields without proper RCU protection, leading to use-after-free or stale pointer exposure.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2400-2424: sk_destruct path defers freeing via call_rcu and broadcasts destroy events"] ,
+  "proposed_fix_summary": "Strengthen RCU annotations for diag paths and ensure diag walkers hold rcu_read_lock when accessing sockets pending RCU free." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0009",
+  "title": "sk_wmem_alloc refcount underflow enabling double free",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Protocol exposes skb_orphan/steal paths", "Fault injection or BPF manipulating sk_wmem_alloc"],
+  "description": "sk_free decrements sk_wmem_alloc and frees when it hits zero. If buggy protocol callbacks drop sk_wmem_alloc multiple times (e.g., via BPF or orphaning) without refcount_t protection, an underflow could trigger __sk_free on a still-referenced sock, leading to double free or premature destruction of protocol state.",
+  "classification": "double-free",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2426-2435: sk_free uses refcount_dec_and_test on sk_wmem_alloc before freeing"] ,
+  "proposed_fix_summary": "Audit callers to ensure symmetric refcounting and consider saturating refcount_t or using kref helpers for sk_wmem_alloc." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0010",
+  "title": "Lock class mismatches for cloned kernel sockets",
+  "attacker_model": "privileged",
+  "preconditions": ["Kernel sockets cloned across families", "Lockdep disabled or ignored"],
+  "description": "sock_lock_init assigns lock classes based on sk_family and sk_kern_sock. When kernel sockets are cloned into a different family or reused after proto switch, lock class keys may mismatch, leading to lockdep blind spots or potential deadlocks not detected in production kernels lacking lockdep.",
+  "classification": "race-condition",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2438-2461: lock classes chosen based on family and kern flag during init"] ,
+  "proposed_fix_summary": "Enforce lock class reset on proto/family changes and add runtime assertions even when lockdep is off." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0011",
+  "title": "Netns tracker reuse leading to stale counters",
+  "attacker_model": "container_guest",
+  "preconditions": ["Frequent socket cloning and teardown in shared netns", "Memory pressure causing delayed destruct"],
+  "description": "sk_clone duplicates ns_tracker references via sock_copy and increments sock_inuse_add. If destruction is deferred by pending wmem or RCU free, net_passive_dec/put_net_track may lag, leaving netns inuse counter elevated and preventing namespace teardown or causing negative inuse when forced cleanup runs later.",
+  "classification": "resource-leak",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2316-2324: netns refs taken during allocation", "net/core/sock.c:2415-2424: free path adjusts inuse counters conditionally"] ,
+  "proposed_fix_summary": "Use refcount_t with debug checks on ns_tracker and assert balanced increments/decrements even when destruction is delayed." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0012",
+  "title": "sk_clone lock path allows priority inversion",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Protocol calling sk_clone with lock=true", "High contention on sk_lock"] ,
+  "description": "When lock=true, sk_clone locks the new socket via bh_lock_sock. Under heavy cloning, low-priority tasks may hold locks while copying large proto state (including filters), blocking high-priority tasks from making progress and causing priority inversion on shared sk_callback_lock or queue locks.",
+  "classification": "DoS",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2465-2499: sk_clone can lock the new socket and perform extensive copying"] ,
+  "proposed_fix_summary": "Minimize locked section during clone or use trylock with backoff for cloned sockets in contended contexts." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0013",
+  "title": "CMSG SO_MARK reachable via legacy capability assumptions",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["User namespace with setuid helper providing socket", "CAP_NET_RAW not held by caller"],
+  "description": "__sock_cmsg_send permits SO_MARK when CAP_NET_RAW or CAP_NET_ADMIN in the socket's user namespace. If a privileged helper opens a socket in init_user_ns and hands it to an unprivileged task, the check still passes and allows mark manipulation from an unprivileged context, bypassing firewall policies based on skb->mark.",
+  "classification": "logic-bypass",
+  "impact": "privilege_escalation",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3016-3024: SO_MARK requires capabilities in socket user_ns, not caller's"],
+  "proposed_fix_summary": "Tie SO_MARK permission to current task creds regardless of socket opener or restrict mark changes on foreign fds." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0014",
+  "title": "Timestamping option misuse without rate limiting",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["SO_TIMESTAMPING allowed on socket", "Ability to flood cmsgs"],
+  "description": "SO_TIMESTAMPING cmsg parsing allows repeated updates to sockc->tsflags without enforcement of rate limiting or privilege beyond length validation. An attacker can spam timestamping requests to inflate per-socket state and trigger expensive time sources, degrading system performance.",
+  "classification": "DoS",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3025-3036: timestamping flags accepted with minimal validation"] ,
+  "proposed_fix_summary": "Add rate limiting or privilege gating for high-cost timestamping options and cap per-socket tsflags updates." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0015",
+  "title": "SCM_TXTIME accepts unverified clocks causing scheduling skew",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["SO_TXTIME enabled", "CMSG SCM_TXTIME used with arbitrary timestamps"],
+  "description": "SCM_TXTIME validates cmsg length but not that transmit_time is in the future or within allowed window. An attacker can set extreme timestamps causing scheduler misbehavior, long sleeps, or overflow in drivers consuming transmit_time, leading to packet drops or hangs.",
+  "classification": "logic-bypass",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3037-3043: SCM_TXTIME accepts arbitrary u64 without bounds or capability checks"] ,
+  "proposed_fix_summary": "Clamp transmit_time to reasonable ranges and require CAP_NET_ADMIN for large offsets; validate against current time." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0016",
+  "title": "Timestamp option ID accepted on TCP contrary to expectation",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["TCP socket", "SOF_TIMESTAMPING_OPT_ID set earlier"],
+  "description": "SCM_TS_OPT_ID explicitly rejects TCP sockets, but sk_tsflags may be set before enforcement. If a TCP socket is re-used or converted, stale tsflags combined with other timestamp cmsgs can leak identifiers or confuse tracing tools, leading to info leak across connections.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3044-3054: SCM_TS_OPT_ID validation dependent on sk_is_tcp and tsflags state"] ,
+  "proposed_fix_summary": "Reset timestamping option flags when protocol switches or when socket transitions to TCP state; enforce stricter protocol checks." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0017",
+  "title": "DMA-BUF cmsg lacks capability gating",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Socket accepts SCM_RIGHTS or SOL_SOCKET control messages", "Attacker knows dmabuf id"],
+  "description": "SCM_DEVMEM_DMABUF accepts an arbitrary u32 id without any capability check. An unprivileged user who learns a dmabuf id could attach it to a socket message, potentially triggering device-side DMA access or leaking buffer lifetime information across namespaces.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3066-3070: SCM_DEVMEM_DMABUF handled with only length validation"] ,
+  "proposed_fix_summary": "Require CAP_SYS_ADMIN or exporter-provided ACL for SCM_DEVMEM_DMABUF and validate dmabuf ownership." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0018",
+  "title": "sock_alloc_send_pskb indefinite wait under wmem exhaustion",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["High rmem/wmem exhaustion via other sockets", "Blocking send without timeout"],
+  "description": "sock_alloc_send_pskb waits on sock_wait_for_wmem when sk_sndbuf is exhausted. An attacker can hold sk_wmem_alloc artificially high (e.g., by corking or withholding acks) causing new senders to sleep indefinitely if timeo is infinite, leading to thread starvation and potential system hang when combined with memalloc sockets.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "high",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2973-2994: loop waits for wmem with no upper bound when timeo is MAX_SCHEDULE_TIMEOUT"] ,
+  "proposed_fix_summary": "Enforce maximum wait or detect hung writers when sk_wmem_alloc remains saturated; add watchdog metrics." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0019",
+  "title": "alloc_skb_with_frags may exhaust high-order pages without fallback",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Large send with max_page_order", "High-order pages scarce"],
+  "description": "sock_alloc_send_pskb calls alloc_skb_with_frags with caller-supplied max_page_order. An attacker can request large pages repeatedly, leading to allocation failure loops and memory fragmentation, denying service to other sockets even though smaller allocations would succeed.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2995-2999: alloc_skb_with_frags invoked with caller-provided max_page_order"] ,
+  "proposed_fix_summary": "Cap max_page_order for unprivileged callers and add fallback to single-page frags under pressure." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0020",
+  "title": "sock_wait_for_wmem side channels via signal interruption",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Ability to send signals to blocked sender", "Shared host with timing measurements"],
+  "description": "sock_alloc_send_pskb exits early on signal_pending and reports sock_intr_errno based on timeo. An attacker co-locating on the host can send signals to a victim process to observe timing of send buffer availability, leaking information about traffic patterns or congestion state.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2989-3004: signal handling terminates wait loop and returns timing-dependent errno"] ,
+  "proposed_fix_summary": "Reduce timing granularity or randomize error returns for interrupted waits to limit side-channel leakage." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0021",
+  "title": "CMSG iteration accepts overlapping headers",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Control over crafted msghdr", "Ability to craft near-overlapping cmsg length"],
+  "description": "sock_cmsg_send uses for_each_cmsghdr and only checks CMSG_OK for each header. Crafted cmsg lengths that barely pass validation may overlap, causing repeated parsing of the same memory and potential exposure of stale stack data or mis-set sockc fields, especially with SCM_DEVMEM_DMABUF or SO_MARK.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3078-3093: iteration over cmsgs trusts CMSG_OK for each element without aggregate bound"] ,
+  "proposed_fix_summary": "Enforce total cmsg length bounds and reject overlapping or non-monotonic cmsg offsets." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0022",
+  "title": "Memory pressure callbacks bypassed for bypass_prot_mem sockets",
+  "attacker_model": "privileged",
+  "preconditions": ["bypass_prot_mem enabled", "Memory pressure triggered"],
+  "description": "sk_page_frag_refill skips memory pressure handling when sk_bypass_prot_mem is set. Attackers with sysctl access can create bypass sockets and allocate page frags without invoking pressure callbacks, allowing uncontrolled memory growth compared to regular sockets.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "high",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3164-3174: sk_page_frag_refill skips pressure for bypass_prot_mem sockets"] ,
+  "proposed_fix_summary": "Always trigger memory pressure notifications regardless of bypass flag or limit bypass flag to trusted contexts." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0023",
+  "title": "High-order page allocations unbounded by sysctl",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["SKB_FRAG_PAGE_ORDER enabled", "net.core.net_high_order_alloc_disable_key false"],
+  "description": "skb_page_frag_refill attempts high-order allocations without per-user or per-cgroup limits when static key allows. An attacker can repeatedly fail high-order allocations to fragment memory and induce OOM or reclaim thrashing, affecting unrelated workloads.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3120-3159: skb_page_frag_refill tries high-order pages with minimal gating"] ,
+  "proposed_fix_summary": "Apply cgroup-aware accounting and rate-limit high-order attempts; disable for unprivileged namespaces." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0024",
+  "title": "__lock_sock unbounded sleep with TASK_UNINTERRUPTIBLE",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Shared socket accessed concurrently", "User cannot receive signals"],
+  "description": "__lock_sock waits on sk_lock.wq in TASK_UNINTERRUPTIBLE until sock_owned_by_user clears. If a task exits without releasing the lock (due to bug or BPF), waiters will sleep indefinitely without being killable, leading to stuck processes and potential system instability.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3178-3193: __lock_sock loops uninterruptibly until lock released"] ,
+  "proposed_fix_summary": "Use interruptible waits or add lock owner watchdog to break hung lock situations." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0025",
+  "title": "__release_sock backlog flush without memory barriers",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Backlogged sk_buffs queued", "Concurrent interrupts processing"] ,
+  "description": "__release_sock iterates backlog and release_queue under sk_lock but may run concurrently with protocol callbacks that assume stronger ordering, potentially causing reordered processing or missed wakeups. An attacker can craft packet sequences to exploit reordering and desynchronize state (e.g., TCP fastopen).",
+  "classification": "race-condition",
+  "impact": "data corruption",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3196-3200: __release_sock drains backlog with minimal barriers"] ,
+  "proposed_fix_summary": "Add explicit memory barriers or stronger locking around backlog flush interactions with protocol callbacks." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0026",
+  "title": "sk_error_report trace side channel",
+  "attacker_model": "remote",
+  "preconditions": ["Access to network endpoint", "Tracing enabled for inet_sk_error_report"],
+  "description": "sk_error_report triggers tracepoints for AF_INET/INET6 when errors occur. Remote attackers can intentionally cause ICMP errors to force trace events and infer kernel tracing configuration or timing, leaking operational data about the host.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:346-359: sk_error_report invokes trace_inet_sk_error_report for inet families"] ,
+  "proposed_fix_summary": "Rate-limit tracepoint emission and sanitize data exposed to trace consumers." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0027",
+  "title": "sock_get_timeout compat path leaks stack remnants",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Compat syscall without COMPAT_USE_64BIT_TIME", "User provides short optlen"] ,
+  "description": "sock_get_timeout copies timeval structures to user buffers depending on old_timeval and compat settings. If optlen is insufficient or partial, earlier stack data may be exposed through the compat structure in edge cases, revealing kernel addresses or timing values.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:362-390: sock_get_timeout writes multiple struct layouts into optval depending on flags"] ,
+  "proposed_fix_summary": "Always zero intermediate structs and validate optlen strictly before writing to user memory." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0028",
+  "title": "sock_copy_user_timeval lacks strict length check for new format",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["SO_RCVTIMEO/SO_SNDTIMEO setsockopt with crafted optlen", "Incompat mode"] ,
+  "description": "sock_copy_user_timeval only checks optlen against old_timeval32 in compat mode and assumes full struct sizes otherwise. Crafted optlen values could lead to partial copies or uninitialized fields being used for timeouts, creating timing side channels or unexpected blocking behavior.",
+  "classification": "logic-bypass",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:393-400: optlen minimal check only for compat32 struct"] ,
+  "proposed_fix_summary": "Validate optlen for all timeval variants and zero-fill before use." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0029",
+  "title": "Potential overflow in timeval conversion for large timeouts",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["setsockopt timeout with extremely large values", "32-bit compat process"] ,
+  "description": "sock_get_timeout converts jiffies to timeval using division; extremely large timeouts in compat mode could overflow old_timeval32 fields, producing negative or wrapped values used in user space logic and enabling logic confusion or bypass of timeout-based security mechanisms.",
+  "classification": "logic-bypass",
+  "impact": "info leak",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:366-379: conversion populates 32-bit timeval structures without overflow checks"] ,
+  "proposed_fix_summary": "Clamp timeout conversion results and reject values exceeding representable ranges for compat structures." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0030",
+  "title": "sk_set_memalloc exposes __GFP_MEMALLOC to userfaultfd writeback",
+  "attacker_model": "privileged",
+  "preconditions": ["SOCK_MEMALLOC set on socket used with userfaultfd or fuse", "Memory pressure scenario"] ,
+  "description": "SOCK_MEMALLOC sets sk_allocation with __GFP_MEMALLOC. If such sockets back userfaultfd or fuse writeback, they may allocate from emergency reserves in contexts not intended for swap I/O, starving the VM and blocking critical reclaim paths.",
+  "classification": "resource-exhaustion",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:302-314: sk_set_memalloc sets __GFP_MEMALLOC on socket allocations"] ,
+  "proposed_fix_summary": "Restrict SOCK_MEMALLOC usage and propagate context-aware gfp masks to userfaultfd/fuse paths." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0031",
+  "title": "Delayed sk_destruct with reuseport detachment",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["SO_REUSEPORT group with many sockets", "Concurrent close and incoming traffic"] ,
+  "description": "sk_destruct detaches reuseport_cb and forces call_rcu. Under heavy reuseport groups, detachment can be deferred while packets still arrive and select sockets based on a stale reuseport array, potentially dereferencing freed sockets or delivering to wrong target.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "medium",
+  "verdict": "probable_vuln",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2400-2407: reuseport_detach_sock triggers call_rcu freeing path"] ,
+  "proposed_fix_summary": "Hold reuseport group references until RCU grace period ends and validate sockets during selection." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0032",
+  "title": "sock_copy duplicates per-socket filters without refcount validation",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["BPF or classic filter attached", "Protocol uses sk_clone"],
+  "description": "sk_clone copies sk_filter pointer via sock_copy but assumes refcounts are adjusted elsewhere. If filter refcounting fails or is bypassed, cloned sockets may share filter without proper reference, enabling attacker to free filter and cause UAF in sibling sockets.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2473-2488: sk_clone calls sock_copy without explicit filter ref handling"] ,
+  "proposed_fix_summary": "Explicitly increment filter references during clone and validate non-NULL pointers before copy." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0033",
+  "title": "sk_page_frag_refill reuses page with refcount==1 causing aliasing",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Attacker holds reference to old page fragment", "Page refcount drops to 1"],
+  "description": "skb_page_frag_refill treats a page with refcount==1 as reusable and resets offset to zero. If an attacker maps the page (e.g., via zero-copy) and drops refs to 1 while retaining access, refill will repurpose the page for a different socket, allowing data injection or leakage between users of the same page.",
+  "classification": "data-corruption",
+  "impact": "data corruption",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3131-3138: page reused when refcount is 1 with no ownership validation"] ,
+  "proposed_fix_summary": "Track ownership of page frags and avoid reuse based solely on refcount; allocate fresh pages when ownership unclear." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0034",
+  "title": "Memory pressure flag clearing races leave pressure asserted",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Shared proto memory_pressure flag", "Rapid open/close of sockets"],
+  "description": "sk_leave_memory_pressure clears sk->sk_prot->memory_pressure when allocations succeed, but concurrent sockets may set it again. Without atomic synchronization, a malicious workload can keep toggling pressure state to starve other protocols or disable pressure prematurely, affecting allocation behavior globally.",
+  "classification": "race-condition",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3105-3115: memory_pressure cleared without atomic or refcounting"] ,
+  "proposed_fix_summary": "Use atomic counters for memory_pressure and enforce minimum hold times before clearing pressure flags." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0035",
+  "title": "sock_error_report callable with partially initialized callbacks",
+  "attacker_model": "local_unprivileged",
+  "preconditions": ["Socket in early initialization", "Protocol error injected via BPF"],
+  "description": "sk_error_report unconditionally invokes sk->sk_error_report and traces for inet families. If the callback is NULL or not fully initialized during early socket setup or after partial teardown, a crafted error injection could dereference NULL or stale pointers, causing crashes.",
+  "classification": "NULL-deref",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:346-358: sk_error_report directly calls sk->sk_error_report without NULL guard"] ,
+  "proposed_fix_summary": "Initialize sk_error_report to safe stubs and guard against NULL before invocation during transitional states." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0036",
+  "title": "Proto owner module use-after-free when sk_prot_switch",
+  "attacker_model": "privileged",
+  "preconditions": ["Dynamic proto switch (e.g., TLS ULP)", "Module unload racing with socket teardown"],
+  "description": "sk_prot_free uses module_put on prot->owner after freeing sk. If a socket switches sk_prot at runtime (e.g., attaching TLS ULP) and teardown races with module unload, module references might be dropped too early, enabling module text to unload while callbacks are still reachable.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2267-2285: sk_prot_free releases module references after freeing socket state"] ,
+  "proposed_fix_summary": "Pin module owners across proto switches and delay module_put until all outstanding callbacks quiesce." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0037",
+  "title": "Backlog processing without rcu_read_lock",
+  "attacker_model": "remote",
+  "preconditions": ["Backlogged packets for RCU-freed socket", "RCU grace not yet elapsed"] ,
+  "description": "__release_sock processes backlog SKBs without explicit rcu_read_lock, relying on sk_lock. If backlog contains packets queued before SOCK_RCU_FREE destruction, processing after call_rcu could dereference freed socket memory, especially for protocols with relaxed locking.",
+  "classification": "UAF",
+  "impact": "kernel crash",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3196-3200: backlog processing lacks explicit RCU guards"] ,
+  "proposed_fix_summary": "Wrap backlog flush in rcu_read_lock or ensure sk pointers in backlog hold references until processed." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0038",
+  "title": "sk_page_frag_refill ignores gfp masking in memcg limits",
+  "attacker_model": "container_guest",
+  "preconditions": ["cgroup memory limits enforced", "Socket in constrained memcg"],
+  "description": "sk_page_frag_refill passes sk->sk_allocation gfp flags but does not check memcg status before attempting high-order pages, potentially charging large allocations to constrained cgroups and triggering memcg OOMs through unprivileged network traffic.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3142-3158: allocation path ignores memcg pressure or limits"] ,
+  "proposed_fix_summary": "Integrate memcg aware allocation policies and cap fragment size under tight cgroup limits." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0039",
+  "title": "net_high_order_alloc_disable_key toggle abuse",
+  "attacker_model": "privileged",
+  "preconditions": ["Ability to toggle static key via sysctl or module", "Shared host workloads"],
+  "description": "High-order frag allocation is guarded by net_high_order_alloc_disable_key static key. A privileged attacker can toggle it to force all sockets to attempt or avoid high-order allocations, influencing allocator behavior and potentially causing fragmentation or latency spikes for other tenants.",
+  "classification": "DoS",
+  "impact": "persistent DoS",
+  "likelihood": "medium",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:3142-3154: high-order allocation controlled by static key"] ,
+  "proposed_fix_summary": "Restrict static key toggling to boot-time or CAP_SYS_ADMIN and add rate limiting to changes." 
+}
+{
+  "file": "net/core/sock.c",
+  "scenario_id": "net/core/sock.c-0040",
+  "title": "sock_alloc_send_pskb error path leaks errno timing",
+  "attacker_model": "remote",
+  "preconditions": ["Can influence congestion to trigger SEND_SHUTDOWN", "Observes errno over time"] ,
+  "description": "sock_alloc_send_pskb returns different errno values depending on shutdown, pending errors, or signal timing. A remote peer that manipulates congestion windows can cause victims to see predictable errno transitions, revealing timing about socket shutdown state and aiding side-channel inference of application behavior.",
+  "classification": "info-leak",
+  "impact": "info leak",
+  "likelihood": "low",
+  "verdict": "hardening_only",
+  "context": "kernel_core",
+  "evidence": ["net/core/sock.c:2973-3005: errno varies with sk_error, SEND_SHUTDOWN, and wait interruptions"] ,
+  "proposed_fix_summary": "Normalize errno behavior for repeated allocation failures and limit timing feedback to callers." 
+}

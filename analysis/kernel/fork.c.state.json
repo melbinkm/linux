@@ -1,0 +1,12 @@
+{
+  "file": "kernel/fork.c",
+  "total_scenarios": 40,
+  "confirmed_vulns": 1,
+  "last_scenario_id": "kernel/fork.c-0040",
+  "high_level_findings": [
+    "Clone flag validation leaves gaps around pidfd and namespace reuse enabling cross-namespace fs/cgroup exposure",
+    "Error and race conditions in copy_process (TLS, task_work, cgroups) risk UAF or refcount leaks under stress",
+    "Seccomp, ptrace, and pidfd interactions create audit and boundary bypass windows across namespaces",
+    "CLONE_PARENT_SETTID write path can be abused with userfaultfd to corrupt arbitrary user mappings"
+  ]
+}

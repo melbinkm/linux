@@ -1,0 +1,11 @@
+{
+  "file": "tools/testing/selftests/timers/mqueue-lat.c",
+  "total_scenarios": 10,
+  "confirmed_vulns": 0,
+  "last_scenario_id": "tools/testing/selftests/timers/mqueue-lat.c-0010",
+  "high_level_findings": [
+    "mq_attr is trusted without checking return codes or bounds, enabling attacker-controlled stack allocations",
+    "Predictable, world-writable queue name /foo allows cross-user interference, message injection, and persistent resource leaks",
+    "Signal and error paths lack cleanup or retries, letting adversaries force test aborts while leaving kernel queues behind"
+  ]
+}

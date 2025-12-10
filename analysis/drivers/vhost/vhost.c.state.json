@@ -1,0 +1,12 @@
+{
+  "file": "drivers/vhost/vhost.c",
+  "total_scenarios": 40,
+  "confirmed_vulns": 2,
+  "last_scenario_id": "drivers/vhost/vhost.c-0040",
+  "high_level_findings": [
+    "Ownership check relies solely on mm equality, enabling ptrace/CLONE_VM hijack of vhost control ioctls.",
+    "Worker lifecycle and RCU handoff races allow stale vring->worker pointers and work execution after free/reset.",
+    "IOTLB/logging handling lacks synchronization on reset, risking stale mappings, info leaks, and data corruption.",
+    "Resource controls (attachment counts, worker creation, iotlb descriptors) permit unprivileged exhaustion of kernel threads and memory."
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "file": "mm/mmap.c",
+  "total_scenarios": 40,
+  "confirmed_vulns": 0,
+  "last_scenario_id": "mm/mmap.c-0040",
+  "high_level_findings": [
+    "mmap flag validation and sealing rely on single-pass checks, leaving races for MAP_FIXED_NOREPLACE, memfd seals, and MAP_SYNC semantics",
+    "ASLR and resource controls are weakly enforced via writable sysctls (legacy_va_layout, mmap_rnd_bits, max_map_count) and one-time reserve calculations",
+    "MAP_DROPPABLE, execute-only pkeys, and path_noexec interactions introduce side channels and TOCTOU paths for unexpected exec or info leaks"
+  ]
+}

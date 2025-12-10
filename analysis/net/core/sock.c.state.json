@@ -1,0 +1,11 @@
+{
+  "file": "net/core/sock.c",
+  "total_scenarios": 40,
+  "confirmed_vulns": 0,
+  "last_scenario_id": "net/core/sock.c-0040",
+  "high_level_findings": [
+    "Capability checks rely on opener credentials, enabling mark/timestamp operations or privileged behavior when sockets are passed across namespaces",
+    "Memory allocation knobs (bypass_prot_mem, SOCK_MEMALLOC, high-order frags) allow unbounded resource use or pressure evasion that can starve the system",
+    "RCU-deferred destruction, reuseport detachment, and backlog processing leave windows for use-after-free and refcount inconsistencies under concurrency"
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "file": "drivers/char/mem.c",
+  "total_scenarios": 40,
+  "confirmed_vulns": 1,
+  "last_scenario_id": "drivers/char/mem.c-0040",
+  "high_level_findings": [
+    "/dev/mem and /dev/port mappings lack strict lifetime and capability checks, enabling MMIO access or hotplug races",
+    "Partial copy and signal-interrupted paths leak or corrupt physical memory due to missing prefaulting and cleanup",
+    "Special devices like /dev/zero/null/full allow unbounded operations useful for DoS or covert channels without accounting"
+  ]
+}

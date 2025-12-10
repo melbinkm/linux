@@ -1,0 +1,11 @@
+{
+  "file": "ipc/msg.c",
+  "total_scenarios": 40,
+  "confirmed_vulns": 1,
+  "last_scenario_id": "ipc/msg.c-0040",
+  "high_level_findings": [
+    "MSG_COPY semantics allow repeated access without per-copy permission checks and racing against dequeue/free leading to leaks",
+    "Queue accounting and limits rely on unchecked arithmetic and namespace configuration, enabling overflows and resource abuse",
+    "RCU and wakeup ordering during queue removal or sleep/wakeup paths expose stale references and potential use-after-free"
+  ]
+}

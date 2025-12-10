@@ -1,0 +1,11 @@
+{
+  "file": "tools/testing/selftests/timers/set-timer-lat.c",
+  "total_scenarios": 10,
+  "confirmed_vulns": 0,
+  "last_scenario_id": "tools/testing/selftests/timers/set-timer-lat.c-0010",
+  "high_level_findings": [
+    "SIGRTMAX handler performs async-unsafe work and shares unsynchronized globals with the main thread",
+    "Timer waits rely on unbounded signal arrival and can hang or miscount when signals are delayed or redirected",
+    "Timing checks reuse adjustable clocks without monotonic references, enabling adversarial clock slews to skew results"
+  ]
+}

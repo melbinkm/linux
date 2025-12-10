@@ -1,0 +1,11 @@
+{
+  "file": "tools/testing/selftests/timers/posix_timers.c",
+  "total_scenarios": 10,
+  "confirmed_vulns": 0,
+  "last_scenario_id": "tools/testing/selftests/timers/posix_timers.c-0010",
+  "high_level_findings": [
+    "Busy-wait and brk-based helpers rely on signal delivery and can spin or allocate indefinitely without additional bounds",
+    "Signal handling uses async-unsafe operations and non-atomic shared counters, risking crashes or miscounts under load",
+    "Timer tests manipulate global process state (signal dispositions, PR_TIMER_CREATE_RESTORE_IDS) without guaranteed restoration"
+  ]
+}

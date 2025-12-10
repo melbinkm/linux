@@ -1,0 +1,11 @@
+{
+  "file": "kernel/exit.c",
+  "total_scenarios": 40,
+  "confirmed_vulns": 0,
+  "last_scenario_id": "kernel/exit.c-0040",
+  "high_level_findings": [
+    "Exit teardown ordering (files/task_work/nsproxy/io_uring) leaves windows for use-after-free and stale references under concurrent exits",
+    "Signal, pidfd, and ptrace interactions during do_exit can leak or misroute exit notifications without stronger locking",
+    "Coredump, userfaultfd, and mm owner transitions during exit remain race-prone with potential accounting and memory safety issues"
+  ]
+}

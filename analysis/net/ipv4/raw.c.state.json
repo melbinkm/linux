@@ -1,0 +1,11 @@
+{
+  "file": "net/ipv4/raw.c",
+  "total_scenarios": 40,
+  "confirmed_vulns": 0,
+  "last_scenario_id": "net/ipv4/raw.c-0040",
+  "high_level_findings": [
+    "Raw socket delivery and error paths clone and deliver packets broadly without per-namespace or per-socket limits, enabling DoS and cross-namespace leakage",
+    "IP_HDRINCL and bind semantics allow spoofing, VRF confusion, and policy bypass when combined with weak capability enforcement",
+    "RCU/close races and insufficient validation on error queues create opportunities for stale skb and stack data exposure"
+  ]
+}

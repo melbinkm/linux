@@ -1,0 +1,10 @@
+{"selected_target_file":"net/netfilter/nf_tables_api.c",
+ "file":"net/netfilter/nf_tables_api.c",
+ "total_scenarios":20,
+ "confirmed_vulns":1,
+ "last_scenario_id":"net/netfilter/nf_tables_api.c-0020",
+ "high_level_findings":[
+  "Commit early return on unbound sets leaves commit_mutex locked, enabling persistent nftables control-plane DoS until reboot.",
+  "GC and abort/commit races across set/flowtable teardown can double-free offload resources or process stale elements, risking crashes and policy bypass.",
+  "Lack of serialization for pending updates and module autoload unlock creates windows where concurrent netlink operations corrupt transaction lists or bypass ownership." 
+ ]}
