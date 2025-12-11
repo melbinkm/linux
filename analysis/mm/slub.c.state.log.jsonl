@@ -1,0 +1,1 @@
+{"file": "mm/slub.c", "timestamp": "2024-06-25T12:00:00Z", "total_scenarios": 20, "confirmed_vulns": 1, "last_scenario_id": "mm/slub.c-0020", "high_level_findings": ["Race condition in `barn_put_full_sheaf` allows exceeding `MAX_FULL_SHEAVES`, leading to unbounded memory usage (DoS).", "Integer overflow risk in `calculate_sizes` for very large objects needs careful validation."]}
