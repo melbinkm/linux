@@ -414,3 +414,56 @@ After analyzing 20 scenarios focused on `kernel/bpf/core.c`, no definitive "True
 - **JIT 32-bit ALU**: Enforce consistent zero-checking for 32-bit division/modulo across all JIT backends.
 - **Allocation Sizes**: Use `check_mul_overflow` or similar safe arithmetic when calculating allocation sizes in `bpf_prog_alloc` and `bpf_jit_binary_alloc`.
 - **RNG**: Consider using a more secure RNG source for JIT constant blinding cookies.
+
+
+### kernel/bpf/arraymap.c — kernel/bpf/arraymap.c-0003: Prog Array Map Circular Reference Leak
+
+**What is the attack?**
+- **Concept**: A `BPF_MAP_TYPE_PROG_ARRAY` map holds references to BPF programs. A BPF program can, in turn, hold a reference to the map it is stored in (or another map that leads back to it), creating a reference cycle.
+- **Vulnerability Path**:
+  - **Setup**: Create a Prog Array Map (M). Load a BPF program (P).
+  - **Trigger**:
+    1. Update Map M to hold Program P (P's refcount increments).
+    2. Program P uses Map M (e.g., via `bpf_tail_call` or by embedding the map reference). This typically happens when the program is loaded with map references or bound to the map.
+    3. Close all userspace file descriptors for M and P.
+  - **Mechanism**:
+    - The refcount for P is > 0 because M holds it.
+    - The refcount for M is > 0 because P holds it.
+    - The kernel's reference counting does not detect cycles.
+    - `bpf_map_put` and `bpf_prog_put` are never called for the final references.
+  - **Result**: The memory for the map and the program is leaked permanently until reboot.
+
+**What can an attacker do?**
+- **Capabilities**: Consume kernel memory (DoS).
+- **Result**: System instability or OOM.
+
+**What’s the impact?**
+- **Classification**: Resource Exhaustion (DoS).
+- **Context**: Requires BPF usage rights.
+
+**Which code files need manual audit to confirm this?**
+- `kernel/bpf/arraymap.c`:
+  - `prog_fd_array_get_ptr`: Handles acquiring reference to program.
+  - `prog_array_map_free`: Handles releasing references.
+- `kernel/bpf/syscall.c`:
+  - `bpf_prog_load`: Where map references are established.
+
+**Where is the vulnerable code snippet?**
+```c
+// kernel/bpf/arraymap.c
+
+static void *prog_fd_array_get_ptr(struct bpf_map *map,
+				   struct file *map_file, int fd)
+{
+	struct bpf_prog *prog = bpf_prog_get(fd);
+    // ...
+    // prog refcount incremented.
+    // If prog holds ref to map, cycle exists.
+	return prog;
+}
+```
+
+**What’s the fix (high-level)?**
+- **Cycle Detection**: Implement cycle detection when updating the map or loading the program.
+- **Weak References**: This is difficult due to the need for validity.
+- **Cleanup**: Provide a mechanism to break cycles (e.g., specific teardown ioctl or automatic reaping).
