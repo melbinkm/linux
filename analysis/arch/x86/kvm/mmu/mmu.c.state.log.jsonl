@@ -1,0 +1,1 @@
+{ "file": "arch/x86/kvm/mmu/mmu.c", "timestamp": "2024-10-24T15:30:00Z", "total_scenarios": 3, "confirmed_vulns": 1, "last_scenario_id": "arch/x86/kvm/mmu/mmu.c-0003", "high_level_findings": ["Live lock vulnerability in eager page splitting logic when system is under load.", "Resource exhaustion vector via RMAP recycle threshold abuse."] }
