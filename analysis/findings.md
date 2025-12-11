@@ -209,3 +209,158 @@ static void barn_put_full_sheaf(struct node_barn *barn, struct slab_sheaf *sheaf
 
 **What’s the fix (high-level)?**
 - **Bounds Checking**: Ensure destination buffer validation before copying metadata.
+
+### kernel/bpf/syscall.c — kernel/bpf/syscall.c-0001: Circular Reference Resource Leak (Prog-Map Cycle)
+
+**What is the attack?**
+- **Concept**: A BPF program can be bound to a BPF map using `bpf_prog_bind_map` (or logically via instructions). A BPF map (specifically `BPF_MAP_TYPE_PROG_ARRAY`) can hold references to BPF programs. This creates a potential circular dependency: Program A -> Map M -> Program A.
+- **Vulnerability Path**:
+  - **Setup**: Create a `BPF_MAP_TYPE_PROG_ARRAY` (Map M). Load a BPF program (Prog A).
+  - **Trigger**:
+    1. Call `bpf_map_update_elem` on Map M to insert Prog A. Map M now holds a reference to Prog A (refcnt++).
+    2. Call `bpf_prog_bind_map` to bind Map M to Prog A. Prog A now holds a reference to Map M (refcnt++).
+  - **Mechanism**:
+    - When the user closes the file descriptors for Prog A and Map M, the user reference counts drop to 0.
+    - However, the kernel reference counts remain at 1 because they hold references to each other.
+    - The standard refcounting mechanism does not detect cycles.
+    - The memory for both objects is never freed.
+- **Impact**:
+  - **Persistent Resource Exhaustion**: An attacker can repeatedly create such cycles to leak kernel memory permanently until a reboot. This is a Denial of Service (DoS).
+
+**What can an attacker do?**
+- **Capabilities**: Leak kernel memory (BPF programs and maps).
+- **Result**: OOM (Out of Memory) crash or degradation.
+
+**What’s the impact?**
+- **Classification**: Resource Exhaustion / Denial of Service.
+- **Context**: Requires `CONFIG_BPF_SYSCALL`. Accessible to users who can load BPF programs (often restricted, but `unprivileged_bpf_disabled=0` allows unpriv users).
+
+**Which code files need manual audit to confirm this?**
+- `kernel/bpf/syscall.c`:
+  - `bpf_prog_bind_map`: Adds map to `used_maps`.
+  - `bpf_map_put`: Decrements ref.
+  - `bpf_prog_put`: Decrements ref.
+
+**Where is the vulnerable code snippet?**
+```c
+// kernel/bpf/syscall.c
+
+static int bpf_prog_bind_map(union bpf_attr *attr)
+{
+    // ...
+    map = bpf_map_get(attr->prog_bind_map.map_fd); // Increment Map Ref
+    // ...
+    // Store map in prog->aux->used_maps
+    used_maps_new[prog->aux->used_map_cnt] = map;
+    // ...
+}
+
+// BPF Map (PROG_ARRAY) implementation holds ref to prog
+// bpf_fd_array_map_update_elem -> bpf_prog_get -> Increment Prog Ref
+```
+
+**What’s the fix (high-level)?**
+- **Cycle Detection**: Implement a cycle detection algorithm when binding maps or updating program arrays.
+- **Weak References**: Use weak references for the bind direction if possible, though this complicates lifetime management.
+- **Hardening**: Limit the number of BPF programs/maps per user to bound the leak impact.
+
+### kernel/bpf/syscall.c — kernel/bpf/syscall.c-0002: Stats Toggle Performance DoS
+
+**What is the attack?**
+- **Concept**: The `BPF_ENABLE_STATS` command uses a global static key (`bpf_stats_enabled_key`) to enable/disable runtime statistics. Modifying a static key is an expensive operation that involves code patching and IPIs (Inter-Processor Interrupts) to all CPUs.
+- **Vulnerability Path**:
+  - **Setup**: Attacker acquires `CAP_SYS_ADMIN` (or is in a container with it).
+  - **Trigger**: Run a tight loop calling `bpf_enable_stats(BPF_STATS_RUN_TIME)` followed immediately by closing the file descriptor (which calls `bpf_stats_release`).
+  - **Mechanism**:
+    - `bpf_enable_stats` calls `static_key_slow_inc`.
+    - `bpf_stats_release` calls `static_key_slow_dec`.
+    - These functions trigger text poking and system-wide synchronization.
+    - Rapidly toggling this state causes significant system overhead and latency spikes for all tasks.
+- **Impact**:
+  - **System Slowdown / DoS**: The system becomes unresponsive due to constant IPI storms and text patching lock contention.
+
+**What can an attacker do?**
+- **Capabilities**: degrade system performance globally.
+- **Result**: Denial of Service.
+
+**What’s the impact?**
+- **Classification**: Denial of Service.
+- **Context**: Requires `CAP_SYS_ADMIN`. Relevant for containerized environments where admin is granted but isolation is expected.
+
+**Which code files need manual audit to confirm this?**
+- `kernel/bpf/syscall.c`:
+  - `bpf_enable_stats`
+  - `bpf_stats_release`
+
+**Where is the vulnerable code snippet?**
+```c
+// kernel/bpf/syscall.c
+
+static int bpf_enable_runtime_stats(void)
+{
+    // ...
+    fd = anon_inode_getfd("bpf-stats", &bpf_stats_fops, NULL, O_CLOEXEC);
+    if (fd >= 0)
+        static_key_slow_inc(&bpf_stats_enabled_key.key); // Expensive
+    // ...
+}
+
+static int bpf_stats_release(struct inode *inode, struct file *file)
+{
+    // ...
+    static_key_slow_dec(&bpf_stats_enabled_key.key); // Expensive
+    // ...
+}
+```
+
+**What’s the fix (high-level)?**
+- **Rate Limiting**: Limit the frequency of stats toggling.
+- **Lighter Mechanism**: Use a read-mostly atomic variable instead of a static key if frequent toggling is expected (trade-off with runtime performance).
+
+### kernel/bpf/syscall.c — kernel/bpf/syscall.c-0003: Bind Map Memory Exhaustion
+
+**What is the attack?**
+- **Concept**: `bpf_prog_bind_map` allows binding additional maps to a BPF program metadata. The implementation reallocates the array of bound maps on every call, copying the old array to the new one. There is no hard limit on the number of bound maps other than memory availability.
+- **Vulnerability Path**:
+  - **Setup**: Load a BPF program.
+  - **Trigger**: Repeatedly call `BPF_PROG_BIND_MAP` with the same map (or different maps).
+  - **Mechanism**:
+    - `bpf_prog_bind_map` allocates `new_array = kmalloc_array(old_count + 1, ...)`.
+    - It copies `old_array` to `new_array`.
+    - The cost of binding N maps is O(N^2) in terms of bytes copied.
+    - An attacker can consume kernel memory and burn CPU time.
+- **Impact**:
+  - **Memory Exhaustion**: Consumes kernel heap.
+  - **CPU Burn**: Quadratic copy cost.
+
+**What can an attacker do?**
+- **Capabilities**: Waste kernel resources.
+- **Result**: Denial of Service (OOM).
+
+**What’s the impact?**
+- **Classification**: Resource Exhaustion.
+- **Context**: `BPF_PROG_BIND_MAP`.
+
+**Which code files need manual audit to confirm this?**
+- `kernel/bpf/syscall.c`:
+  - `bpf_prog_bind_map`
+
+**Where is the vulnerable code snippet?**
+```c
+// kernel/bpf/syscall.c
+
+static int bpf_prog_bind_map(union bpf_attr *attr)
+{
+    // ...
+    used_maps_new = kmalloc_array(prog->aux->used_map_cnt + 1,
+                      sizeof(used_maps_new[0]),
+                      GFP_KERNEL);
+    // ...
+    memcpy(used_maps_new, used_maps_old, ...);
+    // ...
+}
+```
+
+**What’s the fix (high-level)?**
+- **Enforce Limit**: Add a hard limit to `used_map_cnt` (e.g., `BPF_MAX_USED_MAPS`).
+- **Optimization**: Use a more efficient data structure or allocation strategy (e.g., geometric growth) if many binds are expected.
